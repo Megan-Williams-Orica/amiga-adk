@@ -16,7 +16,6 @@
 from __future__ import annotations
 import asyncio
 from pathlib import Path
-import argparse
 
 from farm_ng.canbus.canbus_pb2 import RawCanbusMessage
 from farm_ng.core.event_client import EventClient
@@ -32,7 +31,7 @@ def eff_id(arb29: int) -> int:
         raise ValueError(f"ID {arb29:#x} exceeds 29 bits")
     return CAN_EFF_FLAG | arb29
 
-async def _send_once_farmng(client, arb29: int, payload: bytes) -> None:
+async def _send_sig(client, arb29: int, payload: bytes) -> None:
     msg = RawCanbusMessage()
     msg.id = eff_id(arb29)               # <-- set extended flag here
     msg.remote_transmission = False      # RTR=0 (data frame)
@@ -49,6 +48,6 @@ async def trigger_dipbob(service_config_path: str = "can0") -> None:
     cfg: EventServiceConfig = proto_from_json_file(cfg_path, EventServiceConfig())
     client = EventClient(cfg)
 
-    await _send_once_farmng(client, 0x18FF0007, b"\x06\x00\x02\x00\x00\x00\x00\x00")
+    await _send_sig(client, 0x18FF0007, b"\x06\x00\x02\x00\x00\x00\x00\x00")
     await asyncio.sleep(0.02)
-    await _send_once_farmng(client, 0x18FF0007, b"\x07\x00\x02\x00\x00\x00\x00\x00")
+    await _send_sig(client, 0x18FF0007, b"\x07\x00\x02\x00\x00\x00\x00\x00")
