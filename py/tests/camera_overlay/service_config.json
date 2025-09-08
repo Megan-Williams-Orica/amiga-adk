@@ -1,0 +1,22 @@
+{
+  "name": "oak_spatial_client",
+  "port": 50100,
+  "host": "fox-furrow",
+  "log_level": "INFO",
+  "subscriptions": [
+    {
+      "uri": {
+        "path": "/oak/depth_preview",
+        "query": "service_name=oak_spatial"
+      },
+      "every_n": 1
+    },
+    {
+      "uri": {
+        "path": "/oak/spatial",
+        "query": "service_name=oak_spatial"
+      },
+      "every_n": 1
+    }
+  ]
+}

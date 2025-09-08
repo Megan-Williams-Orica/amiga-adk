@@ -1,0 +1,6 @@
+{
+    "name": "oak1",
+    "port": 50010,
+    "host": "fox-furrow",
+    "log_level": "INFO"
+}
