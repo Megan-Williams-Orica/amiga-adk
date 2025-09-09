@@ -286,74 +286,50 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                 print("[vision] skip: vision_active already true")
                 continue
 
-            # ---- Build the short track (world standoff) ----
+            # --- Overwrite the next waypoint with the detected object's world coords ---
             try:
-                track, goal = await motion_planner.build_track_to_robot_relative_goal(
-                    x, y, standoff_m=0.75, spacing=0.1
-                )
+                idx = await motion_planner.override_next_waypoint_world_xy(X_obj, Y_obj, yaw_rad=yaw)
+                print(f"[vision] replaced next waypoint index {idx} with ({X_obj:.2f}, {Y_obj:.2f})")
             except Exception as e:
-                print(f"[vision] build track failed: {e}")
+                print(f"[vision] override waypoint failed: {e}")
                 continue
 
-            print("[vision] OK → cancel + set_track + start")
+            print("[vision] OK → cancel + set_track + start (to new waypoint)")
 
-            # ---- Run the override safely ----
+            # --- Drive to the (replaced) next waypoint like a normal AB segment ---
             if hasattr(nav_manager, "vision_active"):
                 nav_manager.vision_active = True
 
             try:
                 async with ctl_lock:
+                    # A) sanity: controllable?
                     st = await get_state()
-
-                    # Only pause if not controllable AND currently following
-                    if not st.status.robot_status.controllable:
-                        if st.status.track_status == TrackStatusEnum.TRACK_FOLLOWING:
-                            try:
-                                await controller_client.request_reply("/pause", Empty())
-                                print("[vision] paused follower (auto mode disabled / not controllable)")
-                            except Exception as e:
-                                print(f"[vision] pause failed: {e}")
-                        # Skip this cycle entirely; don't set a new track while not controllable
+                    if not st.robot_status.controllable:
+                        try:
+                            await controller_client.request_reply("/pause", Empty())
+                            print("[vision] paused follower (auto mode disabled / not controllable)")
+                        except Exception as e:
+                            print(f"[vision] pause failed: {e}")
                         continue
 
-                    # cancel current (ignore errors if idle)
+                    # B) cancel current
                     try:
                         await controller_client.request_reply("/cancel", Empty())
                     except Exception:
                         pass
 
-                    # wait until NOT FOLLOWING to avoid “already following” error on /start
+                    # C) wait until not FOLLOWING
                     try:
-                        await wait_until(lambda s: s.status.track_status != TrackStatusEnum.TRACK_FOLLOWING, timeout=3.0)
+                        await wait_until(lambda s: s.status != TrackStatusEnum.TRACK_FOLLOWING, timeout=3.0)
                     except TimeoutError:
-                        print("[vision] warn: still FOLLOWING after cancel; proceeding anyway")
+                        print("[vision] warn: still FOLLOWING after cancel; proceeding")
 
-                    # set → wait LOADED → start → wait FOLLOWING
-                    req = TrackFollowRequest(track=track)
-                    await controller_client.request_reply("/set_track", req)
-                    await wait_until(lambda s: s.status.track_status == TrackStatusEnum.TRACK_LOADED, timeout=2.0)
-                    await controller_client.request_reply("/start", Empty())
-                    await wait_until(lambda s: s.status.track_status == TrackStatusEnum.TRACK_FOLLOWING, timeout=2.0)
+                    # D) build normal AB segment to *next* waypoint and replace+start
+                    #    (this increments current_waypoint_index internally)
+                    track_to_next = await motion_planner._create_ab_segment_to_next_waypoint()
+                    await nav_manager.replace_track_and_start(track_to_next)
 
-                    print("[vision] start sent; goal world = (%.2f, %.2f)" %
-                          (goal.a_from_b.translation[0], goal.a_from_b.translation[1]))
-
-                    # LATCH NOW: ignore further cone messages until terminal or timeout
-                    nav_manager.vision_latched = True
-                    nav_manager.vision_latch_deadline = asyncio.get_event_loop().time() + LATCH_MAX_S
-
-                # optional: light polling (purely for console feedback)
-                t0 = asyncio.get_event_loop().time()
-                while asyncio.get_event_loop().time() - t0 < 4.0:
-                    try:
-                        st = await get_state()
-                        print(f"[vision] follower status: {TrackStatusEnum.Name(st.status.track_status)}")
-                        if _is_terminal(st):
-                            break
-                    except Exception:
-                        pass
-                    await asyncio.sleep(0.25)
-
+                    print("[vision] start sent; heading to replaced waypoint")
             finally:
                 if hasattr(nav_manager, "vision_active"):
                     nav_manager.vision_active = False

@@ -265,6 +265,25 @@ class MotionPlanner:
         tb.create_straight_segment(next_frame_b="tool_to_origin", distance=advance_m, spacing=0.05)
         return tb.track
 
+    async def override_next_waypoint_world_xy(self, X_w: float, Y_w: float, yaw_rad: float | None = None) -> int:
+        """
+        Replace the *next* waypoint with a world pose at (X_w, Y_w). Heading defaults to current robot yaw.
+        Returns the waypoint index that was modified.
+        """
+        # Determine which waypoint to replace (the "next" one)
+        idx = max(1, (self.current_waypoint_index or 0) + 1)
+
+        # Use current heading if none provided
+        if yaw_rad is None:
+            pose_now = await self._get_current_pose()
+            yaw_rad = float(pose_now.a_from_b.rotation.log()[-1])
+
+        # Build a world_from_robot pose for the waypoint (your waypoints dict stores robot poses)
+        iso = Isometry3F64([float(X_w), float(Y_w), 0.0], Rotation3F64.Rz(float(yaw_rad)))
+        world_from_robot = Pose3F64(iso, frame_a="world", frame_b="robot")
+
+        self.waypoints[idx] = world_from_robot
+        return idx
 
     def _angle_difference(self, from_angle: float, to_angle: float) -> float:
         """Calculate the shortest angular difference between two angles."""

@@ -210,7 +210,7 @@ def gnd_to_nadir(p_cam_m, n_up_cam, cam_height_m):
     gnd_dist = math.hypot(d_fwd, d_left)
     return gnd_dist, d_fwd, d_left
 
-def maybe_emit_cone_goal(x_fwd, y_left, conf, label_id, label_map, r_max=6.0, min_period=0.8):
+def maybe_emit_cone_goal(x_fwd, y_left, conf, label_id, label_map, r_max=10.0, min_period=0.8):
     global _last  # <-- important
     r = math.hypot(x_fwd, y_left)
     now = time.time()
