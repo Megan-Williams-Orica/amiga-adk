@@ -44,7 +44,6 @@ def _build_hbridge_cmd(hbridge_id: int, cmd: HBridgeCommandType.ValueType) -> Ac
 # Public API
 # ------------------------------
 
-# TODO: Relabel functions as open/close
 class BaseActuator:
     """Abstract actuator interface."""
 

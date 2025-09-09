@@ -258,12 +258,12 @@ class MotionPlanner:
         return current_pose
 
     async def create_tool_to_origin_segment(self) -> Track:
-        """Micro-move: plumbob→chute/origin. Here we only need +0.22 m forward."""
-        advance_m = 0.22  # your measured value
+        """Micro-move: plumbob→chute/origin. Here we only need +0.30 m forward."""
+        advance_m = 0.30  # your measured value
         current = await self._get_current_pose()
-        tb = TrackBuilder(start=current)
-        tb.create_straight_segment(next_frame_b="tool_to_origin", distance=advance_m, spacing=0.05)
-        return tb.track
+        track_builder = TrackBuilder(start=current)
+        track_builder.create_straight_segment(next_frame_b="tool_to_origin", distance=advance_m, spacing=0.05)
+        return track_builder.track
 
     async def override_next_waypoint_world_xy(self, X_w: float, Y_w: float, yaw_rad: float | None = None) -> int:
         """

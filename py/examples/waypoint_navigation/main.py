@@ -41,7 +41,6 @@ from utils.actuator import BaseActuator, NullActuator, CanHBridgeActuator
 from farm_ng_core_pybind import Pose3F64
 from google.protobuf.empty_pb2 import Empty
 from motion_planner import MotionPlanner
-from utils.canbus import move_robot_forward
 from utils.navigation_manager import NavigationManager
 from utils.multiclient import MultiClientSubscriber as multi
 from utils.pose_cache import set_latest_pose
@@ -458,7 +457,7 @@ if __name__ == "__main__":
     )
     # Required
     parser.add_argument("--waypoints-path", type=Path, required=True,
-                        help="Path to waypoints JSON file (Track format)")
+                        help="Path to waypoints JSON or CSV file (Track format)")
     parser.add_argument("--tool-config-path", type=Path,
                         required=True, help="Path to tool configuration JSON file")
     parser.add_argument(

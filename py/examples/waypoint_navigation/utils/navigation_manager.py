@@ -15,7 +15,7 @@ from farm_ng.track.track_pb2 import (
 )
 from google.protobuf.empty_pb2 import Empty
 from utils.actuator import BaseActuator, NullActuator
-from utils.canbus import move_robot_forward, trigger_dipbob
+from utils.canbus import trigger_dipbob
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +285,7 @@ class NavigationManager:
     async def _cleanup(self):
         """Clean up resources and cancel tasks."""
         logger.info("Starting cleanup...")
-
+ 
         self.shutdown_requested = True
 
         if self.monitor_task and not self.monitor_task.done():
@@ -309,41 +309,46 @@ class NavigationManager:
             await asyncio.sleep(0.05)
 
     def get_user_choice(self) -> str:
-        """Get user input for navigation choice."""
-        if self.no_stop or "waypoint" not in self.curr_segment_name:
-            logger.info(
-                "Either no stop mode enabled or going to the next row, automatically continuing to next waypoint"
-            )
-            return "continue"
+        """Get user input for navigation choice (DEBUG: always continue)."""
+        logger.info("DEBUG: Auto-selecting 'continue' (choice 1).")
+        return "continue"
 
-        print("\n" + "=" * 50)
-        print("NAVIGATION CHOICE")
-        print("=" * 50)
-        print("What would you like to do next?")
-        print("  1. Continue to the next waypoint")
-        print("  2. Redo the current segment")
-        print("  q. Quit navigation")
-        print("-" * 50)
+    # def get_user_choice(self) -> str:
+    #     """Get user input for navigation choice."""
+    #     if self.no_stop or "waypoint" not in self.curr_segment_name:
+    #         logger.info(
+    #             "Either no stop mode enabled or going to the next row, automatically continuing to next waypoint"
+    #         )
+    #         return "continue"
 
-        while True:
-            try:
-                choice = input("Enter your choice (1/2/q): ").strip().lower()
+    #     print("\n" + "=" * 50)
+    #     print("NAVIGATION CHOICE")
+    #     print("=" * 50)
+    #     print("What would you like to do next?")
+    #     print("  1. Continue to the next waypoint")
+    #     print("  2. Redo the current segment")
+    #     print("  q. Quit navigation")
+    #     print("-" * 50)
 
-                if choice in ["1", "c", "continue"]:
-                    print("Continuing to next waypoint...")
-                    return "continue"
-                elif choice in ["2", "r", "redo"]:
-                    print("Redoing current segment...")
-                    return "redo"
-                elif choice in ["q", "quit", "exit"]:
-                    print("Quitting navigation...")
-                    return "quit"
-                else:
-                    print("Invalid choice. Please enter 1, 2, or q.")
+    #     while True:
+    #         try:
+    #             choice = input("Enter your choice (1/2/q): ").strip().lower()
 
-            except (EOFError, KeyboardInterrupt):
-                print("\nNavigation interrupted by user")
-                return "quit"
+    #             if choice in ["1", "c", "continue"]:
+    #                 print("Continuing to next waypoint...")
+    #                 return "continue"
+    #             elif choice in ["2", "r", "redo"]:
+    #                 print("Redoing current segment...")
+    #                 return "redo"
+    #             elif choice in ["q", "quit", "exit"]:
+    #                 print("Quitting navigation...")
+    #                 return "quit"
+    #             else:
+    #                 print("Invalid choice. Please enter 1, 2, or q.")
+
+    #         except (EOFError, KeyboardInterrupt):
+    #             print("\nNavigation interrupted by user")
+    #             return "quit"
 
     async def wait_for_track_completion(self, timeout: float = 60.0) -> bool:
         """Wait for track to complete or fail."""
@@ -415,9 +420,9 @@ class NavigationManager:
                         rate_hz=self.actuator_rate_hz,
                         settle_before=3.0,
                         settle_between=0.0,
-                        wait_for_enter_between=True,
+                        wait_for_enter_between=False,
                         enter_prompt="Hole measured. Press ENTER to close the chute...",
-                        enter_timeout=30.0,      # optional: add a safety timeout if you want
+                        enter_timeout=30.0,      # safety timeout
                     )
             else:
                 logger.warning("ERROR: Track segment failed or timed out")
