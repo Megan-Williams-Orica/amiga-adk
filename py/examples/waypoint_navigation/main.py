@@ -44,6 +44,7 @@ from motion_planner import MotionPlanner
 from utils.canbus import move_robot_forward
 from utils.navigation_manager import NavigationManager
 from utils.multiclient import MultiClientSubscriber as multi
+from utils.pose_cache import set_latest_pose
 
 logger = logging.getLogger("Navigation Manager")
 
@@ -68,6 +69,38 @@ def setup_signal_handlers(nav_manager: NavigationManager) -> None:
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+def _update_pose_from_filter(filter_msg) -> None:
+    """
+    Call this from your existing filter/localization callback.
+    Replace field accessors below to match your message.
+    """
+    # Example mappings (adjust to your types):
+    # If you have a Pose3F64: pose.a_from_b.translation = [y, x, z] or [x,y,z] depending on your convention.
+    x_m = float(filter_msg.pose.translation[0])  # map/world X (meters)
+    y_m = float(filter_msg.pose.translation[1])  # map/world Y (meters)
+
+    # Heading (yaw, radians). If you have a rotation SO3, the z-yaw is log()[-1]
+    # yaw_rad = float(filter_msg.pose.rotation.log()[-1])
+    # or if heading is provided directly:
+    yaw_rad = float(getattr(filter_msg, "pose_yaw_rad", 0.0))
+
+    set_latest_pose(x_m, y_m, yaw_rad)
+    
+async def filter_pose_listener() -> None:
+    """
+    Subscribes to the robot localization/filter event stream and updates the pose cache.
+    Reuse your existing service_config.json / topic.
+    """
+    service_config = proto_from_json_file(EventServiceConfig, "configs/filter_config.json")
+    filter_client = EventClient(config=service_config)
+    await filter_client.start()
+
+    # If you already have a specific channel/topic, use the client for that.
+    # The exact access to msg depends on your event schema:
+    async for event in filter_client.subscribe():
+        filter_msg = event  # or event.data / event.proto depending on your setup
+        _update_pose_from_filter(filter_msg)
+        
 async def vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=10.0):
     """
     Listens for UDP 'cone_goal' messages and overrides the follower by:
@@ -180,10 +213,12 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             # ---- parse ----
             try:
                 msg = json.loads(data.decode())
-                if msg.get("type") != "cone_goal":
+                if msg.get("class_id") != int(6):
                     continue
+                name = str(msg["class_name"])
                 x = float(msg["x_fwd_m"])
                 y = float(msg["y_left_m"])
+                
                 conf = float(msg.get("confidence", 1.0))
             except Exception as e:
                 print(f"[vision] bad msg: {e}")
@@ -194,7 +229,16 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             if pose is None:
                 print("[vision] skip: pose None (filter down)")
                 continue
+            
+            yaw = pose.a_from_b.rotation.log()[-1]
+            xr, yr = pose.a_from_b.translation[0], pose.a_from_b.translation[1]
+            c, s = math.cos(yaw), math.sin(yaw)
 
+            # robot frame (x = forward, y = left)  -> world/map (X, Y)
+            X_obj = xr + x * c - y * s
+            Y_obj = yr + x * s + y * c
+            print(f"[vision] obj world: X={X_obj:.2f} m, Y={Y_obj:.2f} m  | robot @ ({xr:.2f}, {yr:.2f}), ψ={yaw:.2f} rad")
+                    
             # ---- distance to next nominal waypoint (if available) ----
             def distance_to_nominal_or_none():
                 idx = motion_planner.current_waypoint_index + 1
@@ -213,7 +257,6 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             # ---- cone gates (robot frame) ----
             r = math.hypot(x, y)
             print(f"[vision] cone rf: x={x:.2f} y={y:.2f} r={r:.2f} conf={conf:.2f}")
-
             PROX_OK   = (d_nom is not None and d_nom <= proximity_m)  # near nominal path
             CONE_NEAR = (0.3 <= r <= 2.0)                              # very close
             CONE_OK   = (0.3 <= r <= 6.0 and abs(y) <= 3.0 and x >= 0.3 and conf >= 0.5)
@@ -372,6 +415,7 @@ async def main(args) -> None:
         asyncio.create_task(
         vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=10.0)
         )
+        asyncio.create_task(filter_pose_listener())
         
         setup_signal_handlers(nav_manager=nav_manager)
         nav_manager.main_task = asyncio.current_task()

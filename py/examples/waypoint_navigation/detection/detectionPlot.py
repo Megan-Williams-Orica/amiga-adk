@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # detectionPlot_v3.py — DepthAI v3 “latest-only” rendering with FOV overlay + waypoint icon + ground-aware range arcs
 
-import cv2, time, math
+import cv2, time, math, sys
 import depthai as dai
 import numpy as np
 import matplotlib
@@ -14,6 +14,10 @@ import os
 from farm_ng_core_pybind import Isometry3F64
 from farm_ng_core_pybind import Pose3F64
 from farm_ng_core_pybind import Rotation3F64
+
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+from utils.pose_cache import get_latest_pose, set_latest_pose
+
 
 # ---------------- Model / rates ----------------
 modelDescription = dai.NNModelDescription("luxonis/ppe-detection:640x640")
@@ -206,19 +210,24 @@ def gnd_to_nadir(p_cam_m, n_up_cam, cam_height_m):
     gnd_dist = math.hypot(d_fwd, d_left)
     return gnd_dist, d_fwd, d_left
 
-def maybe_emit_cone_goal(x_fwd, y_left, conf, r_max=6.0, min_period=0.8):
+def maybe_emit_cone_goal(x_fwd, y_left, conf, label_id, label_map, r_max=6.0, min_period=0.8):
     global _last  # <-- important
     r = math.hypot(x_fwd, y_left)
     now = time.time()
     # print("Sending goal")
     if r <= r_max and (now - _last[2]) >= min_period:
+        try:
+            class_name = label_map[label_id]
+        except Exception:
+            class_name = str(label_id)
         msg = {
-            "type": "cone_goal",
+            "class_name": class_name,           # include the label id here
+            "class_id": int(label_id),          # explicit numeric id
             "x_fwd_m": float(x_fwd),
             "y_left_m": float(y_left),
             "confidence": float(conf),
             "stamp": now,
-        }
+        } 
         print(msg)
         try:
             sock.sendto(json.dumps(msg).encode("utf-8"), GOAL_ADDR)
@@ -227,6 +236,24 @@ def maybe_emit_cone_goal(x_fwd, y_left, conf, r_max=6.0, min_period=0.8):
             # don’t crash the loop if UDP send fails
             print(f"[vision] UDP send failed: {e}")
 
+def robot_to_world(xr: float, yr: float, yaw: float, dx: float, dy: float):
+    c = math.cos(yaw); s = math.sin(yaw)
+    X = xr + dx * c - dy * s
+    Y = yr + dx * s + dy * c
+    return X, Y
+
+def handle_detection_msg(msg) -> None:
+    pose = get_latest_pose()
+    if pose is None:
+        print("[vision] pose unavailable; cannot compute world coords")
+        return
+
+    dx = float(msg.x)  # forward (+x robot)
+    dy = float(msg.y)  # right   (+y robot)
+
+    Xw, Yw = robot_to_world(pose.x, pose.y, pose.yaw, dx, dy)
+    print(f"[vision] obj world: X={Xw:.2f} m, Y={Yw:.2f} m  | robot @ ({pose.x:.2f}, {pose.y:.2f}), ψ={pose.yaw:.2f} rad")
+    
         
 # ---------------- Visualizer ----------------
 class SpatialVisualizer:
@@ -344,8 +371,17 @@ class SpatialVisualizer:
         cv2.rectangle(frame, (x1,y1), (x2,y2), color, 1)
 
     def update_plot(self, detections):
-        # Robot-frame ground coords
+        # Robot-frame ground coords (for the scatter)
         ys_left, xs_fwd = [], []
+
+        # --- identify cone class ids once ---
+        if not hasattr(self, "_cone_ids"):
+            names = [str(n).strip().lower() for n in (self.labelMap or [])]
+            aliases = {"safety cone", "traffic cone", "cone"}
+            self._cone_ids = {i for i, n in enumerate(names) if n in aliases}
+            if not self._cone_ids:
+                # Fallback to your printed map index if labelMap is missing/empty
+                self._cone_ids = {6}   # 'Safety Cone' in your map
 
         for det in detections:
             # Camera-frame point (meters)
@@ -364,30 +400,28 @@ class SpatialVisualizer:
             v_r = np.array(robot_from_object.a_from_b.translation, dtype=float)
             x_fwd, y_left = v_r[0], v_r[1]
 
-            maybe_emit_cone_goal(x_fwd, y_left, det.confidence)
-            
+            # ---- only emit for cones ----
+            if int(det.label) in self._cone_ids:
+                maybe_emit_cone_goal(x_fwd, y_left, det.confidence, det.label, self.labelMap)
+
+            # (keep plotting ALL detections)
+            # If you want to plot ONLY cones, wrap the block below in the same if above.
             if math.isfinite(x_fwd) and math.isfinite(y_left):
-                
-                # (flip left/right only for the scatter view)
-                y_plot = -y_left
+                y_plot = -y_left   # flip left/right for the scatter view
                 ys_left.append(y_plot)
                 xs_fwd.append(x_fwd)
-                
                 if KEEP_HISTORY:
-                    # reuse history buffers: store (y_left, x_fwd)
                     self.hist_x.append(y_plot)
                     self.hist_z.append(x_fwd)
 
         now = time.time()
         if now - self._last_plot >= PLOT_REFRESH_S:
-            # set_offsets expects [x(horiz), y(vert)] -> [Y_left, X_fwd]
             self.scatter_current.set_offsets(np.c_[ys_left, xs_fwd])
             if KEEP_HISTORY and self.hist_x:
                 self.scatter_hist.set_offsets(np.c_[self.hist_x, self.hist_z])
             self.fig.canvas.draw()
             self.fig.canvas.flush_events()
             self._last_plot = now
-
 
 # ---------------- Transforms (camera -> robot via Pose/Isometry) ----------------
 class Transforms:
