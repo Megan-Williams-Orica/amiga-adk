@@ -84,21 +84,6 @@ def _update_pose_from_filter(filter_msg) -> None:
     yaw_rad = float(getattr(filter_msg, "pose_yaw_rad", 0.0))
 
     set_latest_pose(x_m, y_m, yaw_rad)
-    
-async def filter_pose_listener() -> None:
-    """
-    Subscribes to the robot localization/filter event stream and updates the pose cache.
-    Reuse your existing service_config.json / topic.
-    """
-    service_config = proto_from_json_file(EventServiceConfig, "configs/filter_config.json")
-    filter_client = EventClient(config=service_config)
-    await filter_client.start()
-
-    # If you already have a specific channel/topic, use the client for that.
-    # The exact access to msg depends on your event schema:
-    async for event in filter_client.subscribe():
-        filter_msg = event  # or event.data / event.proto depending on your setup
-        _update_pose_from_filter(filter_msg)
         
 async def vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=10.0):
     """
@@ -118,7 +103,11 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             TrackStatusEnum.TRACK_FAILED,
             TrackStatusEnum.TRACK_TIMEOUT,
         )
-        
+       
+    def controllable_from_state(st) -> bool:
+        rs = getattr(st, "robot_status", None)
+        return bool(getattr(rs, "controllable", False))
+ 
     async def wait_until(pred, timeout: float, poll_s: float = 0.05):
         """
         Poll follower state until pred(state) is True, or timeout elapses.
@@ -240,10 +229,18 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                     
             # ---- distance to next nominal waypoint (if available) ----
             def distance_to_nominal_or_none():
-                idx = motion_planner.current_waypoint_index + 1
-                next_goal = motion_planner.waypoints.get(idx) if hasattr(motion_planner.waypoints, "get") else (
-                    motion_planner.waypoints[idx] if 0 <= idx < len(motion_planner.waypoints) else None
-                )
+                # Primary: the current planned goal (planner keeps it at key 1)
+                next_goal = (motion_planner.waypoints.get(1)
+                            if hasattr(motion_planner.waypoints, "get")
+                            else (motion_planner.waypoints[1] if len(motion_planner.waypoints) > 1 else None))
+                # Optional fallback: try legacy indexing if your waypoints are a list/dict of future goals
+                if next_goal is None:
+                    idx = motion_planner.current_waypoint_index + 1
+                    if hasattr(motion_planner.waypoints, "get"):
+                        next_goal = motion_planner.waypoints.get(idx)
+                    elif 0 <= idx < len(motion_planner.waypoints):
+                        next_goal = motion_planner.waypoints[idx]
+
                 if next_goal is not None:
                     dx, dy = (next_goal.a_from_b.translation - pose.a_from_b.translation)[:2]
                     return math.hypot(dx, dy)
@@ -303,13 +300,14 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                 async with ctl_lock:
                     # A) sanity: controllable?
                     st = await get_state()
-                    if not st.robot_status.controllable:
+                    if not controllable_from_state(st):
                         try:
                             await controller_client.request_reply("/pause", Empty())
-                            print("[vision] paused follower (auto mode disabled / not controllable)")
+                            print("[vision] paused follower mid-run (auto mode disabled)")
                         except Exception as e:
-                            print(f"[vision] pause failed: {e}")
-                        continue
+                            print(f"[vision] pause mid-run failed: {e}")
+                        break
+
 
                     # B) cancel current
                     try:
@@ -390,7 +388,6 @@ async def main(args) -> None:
         asyncio.create_task(
         vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=10.0)
         )
-        asyncio.create_task(filter_pose_listener())
         
         setup_signal_handlers(nav_manager=nav_manager)
         nav_manager.main_task = asyncio.current_task()
