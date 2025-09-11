@@ -14,11 +14,11 @@ import numpy as np
 
 # === Parse arguments ===
 parser = argparse.ArgumentParser(description="Plot blast holes from CSV")
-parser.add_argument("csv_file", help="CSV file containing hole data")
+parser.add_argument("--csv", help="CSV file containing hole data")
 args = parser.parse_args()
 
 # === Load CSV ===
-df = pd.read_csv(args.csv_file)
+df = pd.read_csv(args.csv)
 
 # Column names
 ID_COL      = "ID"

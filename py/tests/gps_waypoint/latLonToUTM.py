@@ -1,161 +1,176 @@
 #!/usr/bin/env python3
-import sys
-import pandas as pd
-from pyproj import Transformer
-import json
-import math
-import argparse
+from __future__ import annotations
 
-# Define known base stations (latitude, longitude)
-BASE_STATIONS = {
-    "SPPT": {"lat": -32.96025, "lon": 151.62366, "alt": 51},
-    "CESS": {"lat": -32.83525, "lon": 151.35657, "alt": 110},
-    "MTLD": {"lat": -32.73698, "lon": 151.56030, "alt": 49},
-    "RAYM": {"lat": -32.76287, "lon": 151.74543, "alt": 43},
+import argparse
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+from pyproj import Transformer
+import csv
+
+# ---------------- Base stations (add yours here) ----------------
+BASE_STATIONS: Dict[str, Dict[str, float]] = {
+    "SPPT": {"E": 371365.70474972005, "N": 6352279.06411331, "alt": 51.1},
+    "CESS":{"E": 346184.37336402666, "N": 6365780.99447662, "alt": 110.2},
+    "MTLD":{"E": 365105.6363451328, "N": 6376954.683843763, "alt": 49.296},
+    "RAYM":{"E": 382486.8256674537, "N": 6374304.294462996, "alt": 43.486},
 }
 
-# Desired constant speed (m/s) for linear velocity
-DESIRED_SPEED = 2.0
+# ---------------- Helpers ----------------
+def _project_lonlat_to_en(lon: float, lat: float, base_crs: str, projection: str) -> Tuple[float, float]:
+    tf = Transformer.from_crs(base_crs, projection, always_xy=True)
+    E, N = tf.transform(lon, lat)
+    return float(E), float(N)
 
+def _resolve_base_EN_alt(
+    *, station: Optional[str], base_en_alt: Optional[Tuple[float, float, Optional[float]]],
+    base_lonlat_alt: Optional[Tuple[float, float, Optional[float]]], base_crs: str, projection: str
+) -> Tuple[float, float, float]:
+    if base_en_alt is not None:
+        E, N, alt = base_en_alt
+        return float(E), float(N), float(alt if alt is not None else 0.0)
 
-def convert_to_relative(df, base_lon, base_lat, projection="EPSG:28356"):
+    if station:
+        info = BASE_STATIONS.get(station)
+        if info is None:
+            raise ValueError(f"Unknown station '{station}'. Add it to BASE_STATIONS.")
+        alt = float(info.get("alt", 0.0))
+        if "E" in info and "N" in info:
+            return float(info["E"]), float(info["N"]), alt
+        if "lon" in info and "lat" in info:
+            E, N = _project_lonlat_to_en(float(info["lon"]), float(info["lat"]), base_crs, projection)
+            return E, N, alt
+        raise ValueError(f"Station '{station}' needs either (E,N[,alt]) or (lon,lat[,alt]).")
+
+    if base_lonlat_alt is not None:
+        lon, lat, alt = base_lonlat_alt
+        E, N = _project_lonlat_to_en(float(lon), float(lat), base_crs, projection)
+        return E, N, float(alt if alt is not None else 0.0)
+
+    raise ValueError("No base provided. Use --station or --base-en or --base-lonlat.")
+
+# ---------------- Core: fill dx/dy in place ----------------
+def fill_dx_dy_inplace_csv(
+    input_csv: Path,
+    *,
+    e_col: str = "X",      # column with MGA Easting
+    n_col: str = "Y",      # column with MGA Northing
+    base_E: float,
+    base_N: float,
+    xy_crs: str = None,    # set if X/Y are NOT already EPSG:7856
+    projection: str = "EPSG:7856",
+    overwrite: bool = False,  # False -> fill blanks only; True -> overwrite all
+) -> None:
     """
-    Convert coordinates in df to metre offsets (dx, dy) from base station.
-    Supports:
-      - Projected coords (columns 'X', 'Y') in same CRS.
-      - Geographic coords ('longitude', 'latitude').
+    Fill dx/dy cells in-place. Do not change any other field.
+    Keeps header & ordering exactly as-is.
     """
-    transformer = Transformer.from_crs("EPSG:4326", projection, always_xy=True)
-    E0, N0 = transformer.transform(base_lon, base_lat)
+    tf = None
+    if xy_crs and xy_crs != projection:
+        tf = Transformer.from_crs(xy_crs, projection, always_xy=True)
 
-    if {"X", "Y"}.issubset(df.columns):
-        df["dx"] = df["X"] - E0
-        df["dy"] = df["Y"] - N0
-    elif {"longitude", "latitude"}.issubset(df.columns):
-        Es, Ns = [], []
-        for lon, lat in zip(df["longitude"], df["latitude"]):
-            e, n = transformer.transform(lon, lat)
-            Es.append(e)
-            Ns.append(n)
-        df["dx"] = [e - E0 for e in Es]
-        df["dy"] = [n - N0 for n in Ns]
-    else:
-        raise ValueError(
-            "CSV must have columns ['X','Y'] or ['longitude','latitude']")
-    return df
+    with open(input_csv, "r", newline="") as f:
+        rows = list(csv.reader(f))
 
+    if not rows:
+        return
 
-def convert_csv_to_relative(input_csv, base_lon, base_lat, projection="EPSG:28356"):
-    df = pd.read_csv(input_csv)
-    return convert_to_relative(df, base_lon, base_lat, projection)
+    header = rows[0]
+    try:
+        idx_E  = header.index(e_col)
+        idx_N  = header.index(n_col)
+        idx_dx = header.index("dx")
+        idx_dy = header.index("dy")
+    except ValueError as e:
+        raise SystemExit(f"Required column missing: {e}")
 
+    for i in range(1, len(rows)):
+        row = rows[i]
+        if len(row) <= max(idx_dx, idx_dy, idx_E, idx_N):
+            continue
 
-def write_csv(df, output_csv):
-    df.to_csv(output_csv, index=False)
+        blank_dx = (row[idx_dx].strip() == "")
+        blank_dy = (row[idx_dy].strip() == "")
 
+        # Skip if we're only filling blanks and both already have values
+        if not overwrite and not (blank_dx or blank_dy):
+            continue
 
-def write_json_poses(df, output_json, z=0.0):
-    """
-    Write a JSON track file with the structure:
-    {
-      "waypoints": [
-        {
-          "aFromB": { … },
-          "frameA": "world",
-          "frameB": "robot",
-          "tangentOfBInA": { … }
-        },
-        …
-      ]
-    }
-    """
-    dxs = df["dx"].tolist()
-    dys = df["dy"].tolist()
-    n = len(dxs)
+        try:
+            E = float(row[idx_E])
+            N = float(row[idx_N])
+        except ValueError:
+            # Non-numeric E/N -> leave row untouched
+            continue
 
-    # Compute headings (yaws)
-    yaws = []
-    for i in range(n):
-        if i < n - 1:
-            yaw = math.atan2(dys[i + 1] - dys[i], dxs[i + 1] - dxs[i])
-        else:
-            yaw = yaws[-1] if yaws else 0.0
-        yaws.append(yaw)
+        if tf is not None:
+            E, N = tf.transform(E, N)
 
-    # Compute distances and dt for constant DESIRED_SPEED
-    distances = []
-    dt_intervals = []
-    for i in range(n):
-        if i < n - 1:
-            dx = dxs[i + 1] - dxs[i]
-            dy = dys[i + 1] - dys[i]
-            dist = math.hypot(dx, dy)
-            dt = dist / DESIRED_SPEED if DESIRED_SPEED > 0 else 0.0
-        else:
-            dist = distances[-1] if distances else 0.0
-            dt = dt_intervals[-1] if dt_intervals else 0.0
-        distances.append(dist)
-        dt_intervals.append(dt)
+        if overwrite or blank_dx:
+            row[idx_dx] = str(E - base_E)
+        if overwrite or blank_dy:
+            row[idx_dy] = str(N - base_N)
 
-    waypoints = []
-    for i, (x, y, yaw) in enumerate(zip(dxs, dys, yaws)):
-        qz = math.sin(yaw / 2)
-        qw = math.cos(yaw / 2)
-        lin = DESIRED_SPEED if distances[i] > 0 else 0.0
-        ang = (yaws[i] - yaws[i - 1]) / \
-            dt_intervals[i] if i > 0 and dt_intervals[i] > 0 else 0.0
+    with open(input_csv, "w", newline="") as f:
+        csv.writer(f).writerows(rows)
 
-        pose_dict = {
-            "aFromB": {
-                "rotation": {
-                    "unitQuaternion": {"imag": {"z": qz}, "real": qw}
-                },
-                "translation": {"x": x, "y": y}
-            },
-            "frameA": "world",
-            "frameB": "robot",
-            "tangentOfBInA": {
-                "linearVelocity": {"x": lin},
-                "angularVelocity": {"z": ang}
-            }
-        }
-        waypoints.append(pose_dict)
-
-    track = {"waypoints": waypoints}
-    # write out the JSON
-    with open(output_json, "w") as f:
-        json.dump(track, f, indent=2)
-
-
+# ---------------- CLI ----------------
 def main():
-    parser = argparse.ArgumentParser(
-        description="Convert waypoints CSV to relative CSV and poses JSON"
+    p = argparse.ArgumentParser(description="Append/Fill dx,dy (metres from base) IN PLACE in the CSV.")
+    p.add_argument("--input-csv", required=True, type=Path, help="CSV to modify in place.")
+    p.add_argument("--projection", default="EPSG:7856",
+                   help="Working CRS for offsets (default: EPSG:7856 GDA2020/MGA56).")
+    p.add_argument("--xy-crs", default=None,
+                   help="CRS of input easting/northing columns if not already in --projection.")
+    p.add_argument("--base-crs", default="EPSG:7844",
+                   help="CRS of lon/lat if using --base-lonlat (default: EPSG:7844 GDA2020 geographic).")
+
+    # Column mapping (your file: X = Easting, Y = Northing)
+    p.add_argument("--e-col", default="X", help="Column containing MGA Easting (m).")
+    p.add_argument("--n-col", default="Y", help="Column containing MGA Northing (m).")
+
+    # Base selection (priority: --base-en > --station > --base-lonlat)
+    p.add_argument("--station", choices=sorted(BASE_STATIONS.keys()),
+                   help="Named base from the script dictionary.")
+    p.add_argument("--base-en", nargs=2, type=float, metavar=("E", "N"),
+                   help="Base Easting, Northing in --projection.")
+    p.add_argument("--base-lonlat", nargs=2, type=float, metavar=("LON", "LAT"),
+                   help="Base longitude, latitude in --base-crs.")
+    p.add_argument("--base-alt", type=float, default=None,
+                   help="Optional base altitude (unused here; dx/dy only).")
+
+    p.add_argument("--overwrite", action="store_true",
+                   help="Overwrite any existing dx/dy instead of filling blanks only.")
+    p.add_argument("--inplace", action="store_true",
+                   help="Fill ONLY dx,dy in the input CSV and write the same file back. No other outputs.")
+
+    args = p.parse_args()
+
+    base_en_alt = (args.base_en[0], args.base_en[1], args.base_alt) if args.base_en else None
+    base_lonlat_alt = (args.base_lonlat[0], args.base_lonlat[1], args.base_alt) if args.base_lonlat else None
+
+    E0, N0, _ = _resolve_base_EN_alt(
+        station=args.station,
+        base_en_alt=base_en_alt,
+        base_lonlat_alt=base_lonlat_alt,
+        base_crs=args.base_crs,
+        projection=args.projection,
     )
-    parser.add_argument("--input-csv", help="Path to input CSV of waypoints")
-    parser.add_argument("--output-csv", help="Path for output relative CSV")
-    parser.add_argument("--output-json", help="Path for output poses JSON")
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--station", choices=BASE_STATIONS.keys(),
-                       help="Use a predefined base station name")
-    group.add_argument("--base", nargs=2, metavar=("LON", "LAT"),
-                       help="Provide base longitude and latitude manually")
 
-    args = parser.parse_args()
-
-    if args.station:
-        base_info = BASE_STATIONS[args.station]
-        base_lat = base_info["lat"]
-        base_lon = base_info["lon"]
+    if args.inplace:
+        fill_dx_dy_inplace_csv(
+            args.input_csv,
+            e_col=args.e_col,
+            n_col=args.n_col,
+            base_E=E0,
+            base_N=N0,
+            xy_crs=args.xy_crs,
+            projection=args.projection,
+            overwrite=args.overwrite,
+        )
+        print(f"Updated '{args.input_csv}' (dx,dy {'overwritten' if args.overwrite else 'filled if blank'}).")
     else:
-        base_lon = float(args.base[0])
-        base_lat = float(args.base[1])
-
-    df_rel = convert_csv_to_relative(args.input_csv, base_lon, base_lat)
-    write_csv(df_rel, args.output_csv)
-    write_json_poses(df_rel, args.output_json)
-    print(
-        f"Wrote relative CSV to '{args.output_csv}' and poses JSON to '{args.output_json}'")
-
+        print("Nothing to do. Pass --inplace to modify the CSV in place.")
 
 if __name__ == "__main__":
     main()
+
