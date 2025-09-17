@@ -69,6 +69,20 @@ _last = (0.0, 0.0, 0.0)
 # OPTIONAL: lock to a specific device (MxID or name). Leave as "" to use default device.
 TARGET_DEVICE  = "14442C1001A528D700"  # or ""
 
+# -------------Headless-safe---------------
+def safe_imshow(name, img):
+    try:
+        cv2.imshow(name, img)
+    except cv2.error:
+        pass  # headless: no GUI backend
+
+def safe_waitkey(delay=1):
+    try:
+        return cv2.waitKey(delay)
+    except cv2.error:
+        time.sleep(delay/1000.0)
+        return -1
+
 # ---------------- Helpers ----------------
 def project_point_to_pixels(x_m, y_m, z_m, img_w, img_h, hfov_deg, vfov_deg=None):
     """
@@ -276,7 +290,7 @@ class SpatialVisualizer:
         self.hist_x, self.hist_z = [], []
 
         # Waypoint marker on the X–Z map (camera-frame coordinates)
-        self.waypoint_handle = self.ax.scatter([WAYPOINT_X_M], [WAYPOINT_Z_M], marker="X", s=90)
+        # self.waypoint_handle = self.ax.scatter([WAYPOINT_X_M], [WAYPOINT_Z_M], marker="X", s=90)
 
         self._last_plot = time.time()
         self.labelMap = []
@@ -580,12 +594,12 @@ with pipeline:
 
             # Show windows
             # cv2.imshow("depth", depthColor)
-            cv2.imshow("rgb", latestRgb)
+            safe_imshow("rgb", latestRgb)
 
             # Update X–Z map
             vis.update_plot(latestDets)
 
-        if cv2.waitKey(1) == ord('q'):
+        if (safe_waitkey(1) & 0xFF) == ord('q'):
             break
 
 cv2.destroyAllWindows()
