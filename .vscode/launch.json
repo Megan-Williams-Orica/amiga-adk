@@ -19,7 +19,7 @@
                 "--tool-config-path",
                 "./configs/tool_config.json",
                 "--waypoints-path",
-                "./surveyed-waypoints/powerLinesTest1.csv",
+                "./surveyed-waypoints/waypointTest1.csv",
                 "--last-row-waypoint-index",
                 "4",
                 "--turn-direction",
@@ -28,13 +28,6 @@
                 "6.0",
                 "--headland-buffer",
                 "6.0",
-                "--actuator-enabled",
-                "--actuator-id",
-                "0",
-                "--actuator-open-seconds",
-                "6",
-                "--actuator-close-seconds",
-                "7",
             ],
         }
     ]

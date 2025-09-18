@@ -85,7 +85,8 @@ def _update_pose_from_filter(filter_msg) -> None:
 
     set_latest_pose(x_m, y_m, yaw_rad)
         
-async def vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=10.0):
+# TODO: Refactor into a separate module
+async def vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=2.0):
     """
     Listens for UDP 'cone_goal' messages and overrides the follower by:
       /cancel -> /set_track (short vision track) -> /start
@@ -96,14 +97,15 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
     async def get_state() -> TrackFollowerState:
         return await controller_client.request_reply("/get_state", Empty(), decode=True)
 
+    # True if the follower is in any terminal state (COMPLETE / ABORTED / FAILED)
     def _is_terminal(st: TrackFollowerState) -> bool:
         return st.status.track_status in (
             TrackStatusEnum.TRACK_COMPLETE,
             TrackStatusEnum.TRACK_ABORTED,
             TrackStatusEnum.TRACK_FAILED,
-            TrackStatusEnum.TRACK_TIMEOUT,
         )
        
+    # Pulls robot_status.controllable from the state (i.e., AUTO mode enabled and no safety fault).
     def controllable_from_state(st) -> bool:
         rs = getattr(st, "robot_status", None)
         return bool(getattr(rs, "controllable", False))
@@ -131,7 +133,7 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                     continue
             except Exception as e:
                 # transient RPC/wire hiccup; keep trying until deadline
-                # (optionally log: print(f"[vision] get_state failed: {e}"))
+                # (optionally log: print(f"[VISION] get_state failed: {e}"))
                 continue
 
         return st
@@ -195,7 +197,7 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             except socket.timeout:
                 continue
             except Exception as e:
-                print(f"[vision] recv error: {e}")
+                print(f"[VISION] recv error: {e}")
                 continue
 
             # ---- parse ----
@@ -209,13 +211,13 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                 
                 conf = float(msg.get("confidence", 1.0))
             except Exception as e:
-                print(f"[vision] bad msg: {e}")
+                print(f"[VISION] bad msg: {e}")
                 continue
 
             # ---- pose check ----
             pose = await motion_planner._get_current_pose()
             if pose is None:
-                print("[vision] skip: pose None (filter down)")
+                print("[VISION] skip: pose None (filter down)")
                 continue
             
             yaw = pose.a_from_b.rotation.log()[-1]
@@ -223,9 +225,10 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             c, s = math.cos(yaw), math.sin(yaw)
 
             # robot frame (x = forward, y = left)  -> world/map (X, Y)
+            
             X_obj = xr + x * c - y * s
             Y_obj = yr + x * s + y * c
-            print(f"[vision] obj world: X={X_obj:.2f} m, Y={Y_obj:.2f} m  | robot @ ({xr:.2f}, {yr:.2f}), ψ={yaw:.2f} rad")
+            print(f"[VISION] obj world: Y={X_obj:.2f} m, X={-Y_obj:.2f} m  | robot @ ({xr:.2f}, {yr:.2f}), ψ={yaw:.2f} rad")
                     
             # ---- distance to next nominal waypoint (if available) ----
             def distance_to_nominal_or_none():
@@ -248,11 +251,11 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
 
             d_nom = distance_to_nominal_or_none()
             if d_nom is not None:
-                print(f"[vision] proximity: {d_nom:.2f} m (threshold {proximity_m:.2f})")
+                print(f"[VISION] proximity: {d_nom:.2f} m (threshold {proximity_m:.2f})")
 
             # ---- cone gates (robot frame) ----
             r = math.hypot(x, y)
-            print(f"[vision] cone rf: x={x:.2f} y={y:.2f} r={r:.2f} conf={conf:.2f}")
+            print(f"[VISION] cone rf: x={x:.2f} y={y:.2f} r={r:.2f} conf={conf:.2f}")
             PROX_OK   = (d_nom is not None and d_nom <= proximity_m)  # near nominal path
             CONE_NEAR = (0.3 <= r <= 2.0)                              # very close
             CONE_OK   = (0.3 <= r <= 6.0 and abs(y) <= 3.0 and x >= 0.3 and conf >= 0.5)
@@ -266,7 +269,7 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             FOLLOWING_OK = (is_following and CONE_OK)
 
             if not (PROX_OK or CONE_NEAR or FOLLOWING_OK):
-                print("[vision] skip: gate (need near nominal OR cone near OR following+good cone)")
+                print("[VISION] skip: gate (need near nominal OR cone near OR following+good cone)")
                 continue
 
             # ---- debounce ----
@@ -274,24 +277,28 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             if last_goal is not None:
                 moved = math.hypot(x - last_goal[0], y - last_goal[1])
                 if moved < MIN_DIST_DELTA and (now - last_sent_t) < MIN_PERIOD_S:
-                    print(f"[vision] skip: debounce (moved={moved:.2f}, dt={now-last_sent_t:.2f})")
+                    print(f"[VISION] skip: debounce (moved={moved:.2f}, dt={now-last_sent_t:.2f})")
                     continue
 
             # ---- don't stack overrides ----
             if getattr(nav_manager, "vision_active", False):
-                print("[vision] skip: vision_active already true")
+                print("[VISION] skip: vision_active already true")
                 continue
 
             # --- Overwrite the next waypoint with the detected object's world coords ---
             try:
                 idx = await motion_planner.override_next_waypoint_world_xy(X_obj, Y_obj, yaw_rad=yaw)
-                print(f"[vision] replaced next waypoint index {idx} with ({X_obj:.2f}, {Y_obj:.2f})")
+                print(f"[VISION] replaced next waypoint index {idx} with ({X_obj:.2f}, {Y_obj:.2f})")
             except Exception as e:
-                print(f"[vision] override waypoint failed: {e}")
+                print(f"[VISION] override waypoint failed: {e}")
                 continue
 
-            print("[vision] OK → cancel + set_track + start (to new waypoint)")
+            print("[VISION] OK → cancel + set_track + start (to new waypoint)")
 
+            # Activate latch to lock onto cone
+            nav_manager.vision_latched = True
+            nav_manager.vision_latch_deadline = asyncio.get_event_loop().time() + LATCH_MAX_S
+            print(f"[VISION] latched on target for up to {LATCH_MAX_S:.1f} s")
             # --- Drive to the (replaced) next waypoint like a normal AB segment ---
             if hasattr(nav_manager, "vision_active"):
                 nav_manager.vision_active = True
@@ -301,13 +308,18 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                     # A) sanity: controllable?
                     st = await get_state()
                     if not controllable_from_state(st):
+                        print("[VISION] paused follower mid-run (auto mode disabled)")
+                        continue
+                    
+                    if st.status.track_status == TrackStatusEnum.TRACK_FOLLOWING:
                         try:
                             await controller_client.request_reply("/pause", Empty())
-                            print("[vision] paused follower mid-run (auto mode disabled)")
+                            print("[VISION] paused follower mid-run")
                         except Exception as e:
-                            print(f"[vision] pause mid-run failed: {e}")
-                        break
-
+                            print(f"[VISION] pause mid-run failed: {e}")
+                    else:
+                        # No pause needed (LOADED/COMPLETE/etc.)
+                        pass
 
                     # B) cancel current
                     try:
@@ -319,14 +331,14 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                     try:
                         await wait_until(lambda s: s.status != TrackStatusEnum.TRACK_FOLLOWING, timeout=3.0)
                     except TimeoutError:
-                        print("[vision] warn: still FOLLOWING after cancel; proceeding")
+                        print("[VISION] warn: still FOLLOWING after cancel; proceeding")
 
                     # D) build normal AB segment to *next* waypoint and replace+start
                     #    (this increments current_waypoint_index internally)
                     track_to_next = await motion_planner._create_ab_segment_to_next_waypoint()
                     await nav_manager.replace_track_and_start(track_to_next)
 
-                    print("[vision] start sent; heading to replaced waypoint")
+                    print("[VISION] start sent; heading to replaced waypoint")
             finally:
                 if hasattr(nav_manager, "vision_active"):
                     nav_manager.vision_active = False
@@ -386,7 +398,7 @@ async def main(args) -> None:
         )
 
         asyncio.create_task(
-        vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=10.0)
+        vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=4.0)
         )
         
         setup_signal_handlers(nav_manager=nav_manager)
