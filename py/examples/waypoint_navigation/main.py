@@ -175,6 +175,7 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                 try:
                     st = await get_state()
                     if _is_terminal(st) or (asyncio.get_event_loop().time() >= nav_manager.vision_latch_deadline):
+                        print("[VISION] unlatching (terminal state or timeout)")
                         nav_manager.vision_latched = False
                         # small grace to avoid immediate re-trigger on the same frame
                         await asyncio.sleep(0.2)
