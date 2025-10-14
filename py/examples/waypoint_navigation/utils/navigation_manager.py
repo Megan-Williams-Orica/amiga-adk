@@ -58,6 +58,7 @@ class NavigationManager:
         self.no_stop = no_stop
         self.actuator = actuator or NullActuator()
         self.vision_active = False
+        self.actuator_deploying = False
         self._controller_lock = getattr(self, "_controller_lock", asyncio.Lock())
 
 
@@ -308,6 +309,48 @@ class NavigationManager:
         while self.vision_active and not self.shutdown_requested:
             await asyncio.sleep(0.05)
 
+    async def _wait_for_cone_or_skip(self) -> bool:
+        """
+        Wait for vision to detect a cone in the search zone if vision is enabled.
+        If vision is NOT enabled, proceed immediately to CSV waypoint.
+        If vision IS enabled, wait indefinitely for cone detection.
+        Returns True to proceed, False if shutdown requested.
+        """
+        # Import here to avoid circular dependency
+        import subprocess
+
+        # Check if vision (detectionPlot.py) is running
+        try:
+            result = subprocess.run(
+                ["pgrep", "-f", "detectionPlot.py"],
+                capture_output=True,
+                text=True,
+                timeout=1.0
+            )
+            vision_enabled = (result.returncode == 0)
+        except Exception:
+            vision_enabled = False
+
+        if not vision_enabled:
+            logger.info("[VISION] Vision not enabled (detectionPlot.py not running), proceeding to CSV waypoint")
+            return True  # Vision not enabled, proceed to CSV waypoint immediately
+
+        # Vision is enabled - reset cone detection flag for new waypoint
+        self.cone_detected_for_current_wp = False
+        self.current_waypoint_start_time = asyncio.get_event_loop().time()
+
+        logger.info("[VISION] Vision enabled - waiting indefinitely for cone detection in search zone...")
+
+        # Wait indefinitely for cone detection
+        while not getattr(self, "cone_detected_for_current_wp", False):
+            if self.shutdown_requested:
+                return False
+
+            await asyncio.sleep(0.1)
+
+        logger.info("[VISION] Cone detected in search zone - proceeding to cone")
+        return True
+
     def get_user_choice(self) -> str:
         """Get user input for navigation choice (DEBUG: always continue)."""
         logger.info("DEBUG: Auto-selecting 'continue' (choice 1).")
@@ -398,32 +441,39 @@ class NavigationManager:
             if success:
                 logger.info("SUCCESS: Track segment completed")
                 if do_post_actions and self.actuator_enabled:
-                    # 1) wait briefly
-                    await asyncio.sleep(2.0)
+                    # Set flag to disable vision during deployment
+                    self.actuator_deploying = True
 
-                    # 2) Deploy plumbob (tool already over hole)
-                    await trigger_dipbob("can0")
-                    logger.info("Deploying dipbob")
-                    await asyncio.sleep(3.0)  # TODO: swap for measurement await
+                    try:
+                        # 1) wait briefly
+                        await asyncio.sleep(2.0)
 
-                    # 3) Move forward so robot origin is over the hole
-                    origin_track = await self.motion_planner.create_tool_to_origin_segment()
-                    ok2 = await self.execute_single_track(origin_track, timeout=15.0, do_post_actions=False)
-                    if not ok2:
-                        logger.warning("tool→origin micro-segment failed; skipping chute pulse")
-                        return success  # don't open chute if failed
+                        # 2) Deploy plumbob (tool already over hole)
+                        await trigger_dipbob("can0")
+                        logger.info("Deploying dipbob")
+                        await asyncio.sleep(3.0)  # TODO: swap for measurement await
 
-                    # 4) Open/close chute
-                    await self.actuator.pulse_sequence(
-                        open_seconds=self.actuator_open_seconds,
-                        close_seconds=self.actuator_close_seconds,
-                        rate_hz=self.actuator_rate_hz,
-                        settle_before=3.0,
-                        settle_between=0.0,
-                        wait_for_enter_between=False,
-                        enter_prompt="Hole measured. Press ENTER to close the chute...",
-                        enter_timeout=30.0,      # safety timeout
-                    )
+                        # 3) Move forward so robot origin is over the hole
+                        origin_track = await self.motion_planner.create_tool_to_origin_segment()
+                        ok2 = await self.execute_single_track(origin_track, timeout=15.0, do_post_actions=False)
+                        if not ok2:
+                            logger.warning("tool→origin micro-segment failed; skipping chute pulse")
+                            return success  # don't open chute if failed
+
+                        # 4) Open/close chute
+                        await self.actuator.pulse_sequence(
+                            open_seconds=self.actuator_open_seconds,
+                            close_seconds=self.actuator_close_seconds,
+                            rate_hz=self.actuator_rate_hz,
+                            settle_before=3.0,
+                            settle_between=0.0,
+                            wait_for_enter_between=False,
+                            enter_prompt="Hole measured. Press ENTER to close the chute...",
+                            enter_timeout=30.0,      # safety timeout
+                        )
+                    finally:
+                        # Clear flag when deployment is complete
+                        self.actuator_deploying = False
             else:
                 logger.warning("ERROR: Track segment failed or timed out")
 
@@ -483,9 +533,38 @@ class NavigationManager:
                     f"Executing track segment {segment_count} with {len(track_segment.waypoints)} waypoints"
                 )
 
-                # Don’t launch execution while vision overrides are active
-                await self._hold_if_vision_active()
-                success = await self.execute_single_track(track_segment)
+                # Check if this is a waypoint segment (not turn/approach) and wait for vision if enabled
+                if "waypoint" in segment_name.lower():
+                    # Use _wait_for_cone_or_skip which checks if vision is enabled
+                    # If vision is enabled: waits indefinitely for cone
+                    # If vision is disabled: proceeds immediately to CSV waypoint
+                    should_proceed = await self._wait_for_cone_or_skip()
+
+                    if not should_proceed:
+                        # Shutdown was requested during wait
+                        break
+
+                    # Reset flag for next waypoint
+                    self.cone_detected_for_current_wp = False
+
+                # IMPORTANT: Check if vision will execute BEFORE checking vision_active
+                # Vision sets vision_executed_segment first, then vision_active
+                # If we check vision_active first, we might start executing before vision sets it
+                if getattr(self, "vision_executed_segment", False):
+                    logger.info("[VISION] Vision will execute this segment - skipping main navigation execution")
+                    self.vision_executed_segment = False  # Reset for next segment
+
+                    # Wait for vision to complete execution before continuing
+                    logger.info("[VISION] Waiting for vision execution to complete...")
+                    await self._hold_if_vision_active()
+                    logger.info("[VISION] Vision execution complete")
+
+                    success = True
+                else:
+                    # Don't launch execution while vision overrides are active
+                    await self._hold_if_vision_active()
+                    success = await self.execute_single_track(track_segment)
+
                 failed_attempts: int = 0
 
                 while not success:
@@ -495,7 +574,7 @@ class NavigationManager:
                         f"Failed to execute segment {segment_count}. Stopping navigation.")
                     failed_attempts += 1
                     if segment_count == 1 and failed_attempts > 5:
-                        await move_robot_forward(time_goal=1.5)
+                        # await move_robot_forward(time_goal=1.5) #TODO: implement
                         logger.info(
                             f"Moving robot forward | Failed attempts: {failed_attempts}")
                         failed_attempts = 0

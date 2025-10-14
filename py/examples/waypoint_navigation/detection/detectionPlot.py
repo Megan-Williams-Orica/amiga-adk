@@ -37,7 +37,7 @@ theta = math.radians(TILT_DEG)
 # Cone/Hole goal
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 GOAL_ADDR = ("127.0.0.1", 41234)
-_last = (0,0,0.0)
+_last = (0.0, 0.0, 0.0)
 
 # Camera frame: +X right, +Y down, +Z forward. Level camera => up = [0, -1, 0].
 # With forward tilt, up tilts toward +Z: [0, -cos(theta), -sin(theta)].
@@ -58,13 +58,6 @@ ARCS_METERS = [1.0, 2.0, 3.0, 4.0, 6.0]
 WAYPOINT_X_M = -0.35
 WAYPOINT_Y_M =  0.35
 WAYPOINT_Z_M =  2.32
-
-
-GOAL_ADDR = ("127.0.0.1", 41234)
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-
-# last sent (x, y, t)
-_last = (0.0, 0.0, 0.0)
 
 # OPTIONAL: lock to a specific device (MxID or name). Leave as "" to use default device.
 TARGET_DEVICE  = "14442C1001A528D700"  # or ""
@@ -260,8 +253,15 @@ class SpatialVisualizer:
     def __init__(self, n_up_cam):
         matplotlib.rcParams['toolbar'] = 'None'
         plt.ion()
-        self.fig, self.ax = plt.subplots(num="OAK-D: Top-Down Scatter (robot frame)")
-        # Robot/world (NWU): horizontal = Y (left +, right -), vertical = X (forward +)
+        # Create figure with 1 row, 2 columns
+        self.fig, (self.ax_img, self.ax) = plt.subplots(1, 2, num="OAK-D: Camera + Scatter", figsize=(16, 6))
+
+        # Image subplot (left)
+        self.ax_img.set_title("RGB Camera")
+        self.ax_img.axis('off')
+        self.img_display = None
+
+        # Scatter subplot (right) - existing code
         self.ax.set_xlabel("Y (m)  [left +, right -]")
         self.ax.set_ylabel("X (m)  [forward +]")
         self.ax.set_xlim(-MAX_RANGE_M_X, MAX_RANGE_M_X)
@@ -322,6 +322,16 @@ class SpatialVisualizer:
             if np.any(mask):
                 self.ax.plot(y[mask], x[mask], linestyle=":", alpha=0.7)
                 self.ax.text(0.05, r * 0.98, f"{int(r)} m", fontsize=9, alpha=0.8)
+              
+    def update_image(self, rgb_frame):
+          """Update the RGB camera subplot."""
+          # Convert BGR (OpenCV) to RGB (matplotlib)
+          rgb = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2RGB)
+
+          if self.img_display is None:
+              self.img_display = self.ax_img.imshow(rgb)
+          else:
+              self.img_display.set_data(rgb)
                 
     def processDepthFrame(self, depthFrame):
         dds = depthFrame[::4]
@@ -355,7 +365,7 @@ class SpatialVisualizer:
 
         
 
-        # Camera-frame readout (kept since you said XYZ are accurate)
+        # Camera-frame readout 
         try:
             label = self.labelMap[det.label]
         except Exception:
@@ -383,6 +393,10 @@ class SpatialVisualizer:
                 # Fallback to your printed map index if labelMap is missing/empty
                 self._cone_ids = {6}   # 'Safety Cone' in your map
 
+        # Track the closest cone to emit (only one message per frame)
+        closest_cone = None
+        closest_distance = float('inf')
+
         for det in detections:
             # Camera-frame point (meters)
             p_cam = np.array([
@@ -400,12 +414,14 @@ class SpatialVisualizer:
             v_r = np.array(robot_from_object.a_from_b.translation, dtype=float)
             x_fwd, y_left = v_r[0], v_r[1]
 
-            # ---- only emit for cones ----
+            # ---- track closest cone for emission ----
             if int(det.label) in self._cone_ids:
-                maybe_emit_cone_goal(x_fwd, y_left, det.confidence, det.label, self.labelMap)
+                distance = math.hypot(x_fwd, y_left)
+                if distance < closest_distance:
+                    closest_distance = distance
+                    closest_cone = (x_fwd, y_left, det.confidence, det.label)
 
-            # (keep plotting ALL detections)
-            # If you want to plot ONLY cones, wrap the block below in the same if above.
+            # Keep plotting ALL detections (not just cones)
             if math.isfinite(x_fwd) and math.isfinite(y_left):
                 y_plot = -y_left   # flip left/right for the scatter view
                 ys_left.append(y_plot)
@@ -413,6 +429,11 @@ class SpatialVisualizer:
                 if KEEP_HISTORY:
                     self.hist_x.append(y_plot)
                     self.hist_z.append(x_fwd)
+
+        # Emit only the closest cone (if any cone was detected this frame)
+        if closest_cone is not None:
+            x_fwd, y_left, conf, label = closest_cone
+            maybe_emit_cone_goal(x_fwd, y_left, conf, label, self.labelMap)
 
         now = time.time()
         if now - self._last_plot >= PLOT_REFRESH_S:
@@ -537,56 +558,66 @@ with pipeline:
     hfov_deg = RGB_HFOV_DEG if USE_RGB_FOV else STEREO_HFOV_DEG
     img_w = img_h = None
 
-    while pipeline.isRunning():
-        depthMsg = drain_latest(qDepth)
-        if depthMsg is not None:
-            latestDepth = depthMsg.getFrame()
+    try:
+        while pipeline.isRunning():
+            depthMsg = drain_latest(qDepth)
+            if depthMsg is not None:
+                latestDepth = depthMsg.getFrame()
 
-        detMsg = drain_latest(qDet)
-        if detMsg is not None:
-            latestDets = detMsg.detections
+            detMsg = drain_latest(qDet)
+            if detMsg is not None:
+                latestDets = detMsg.detections
 
-        rgbMsg = drain_latest(qRgb)
-        if rgbMsg is not None:
-            latestRgb = rgbMsg.getCvFrame()
-            if img_w is None:
-                img_h, img_w = latestRgb.shape[:2]
+            rgbMsg = drain_latest(qRgb)
+            if rgbMsg is not None:
+                latestRgb = rgbMsg.getCvFrame()
+                if img_w is None:
+                    img_h, img_w = latestRgb.shape[:2]
 
-        if latestRgb is not None and latestDepth is not None:
-            depthColor = vis.processDepthFrame(latestDepth.copy())
-            h, w, _ = latestRgb.shape
+            if latestRgb is not None and latestDepth is not None:
+                depthColor = vis.processDepthFrame(latestDepth.copy())
+                h, w, _ = latestRgb.shape
 
-            # Draw detections
-            for det in latestDets:
-                try: 
-                    vis.drawBBoxOnDepth(depthColor, det)
+                # Draw detections
+                for det in latestDets:
+                    try:
+                        vis.drawBBoxOnDepth(depthColor, det)
+                    except Exception:
+                        pass
+                    vis.drawDetOnRgb(latestRgb, det, w, h)
+
+                # Waypoint + (optional) FOV/ground-aware arcs on the NN view
+                if img_w is not None:
+                    uv = project_point_to_pixels(
+                        WAYPOINT_X_M, WAYPOINT_Y_M, WAYPOINT_Z_M,
+                        img_w, img_h, hfov_deg, vfov_deg=RGB_VFOV_DEG
+                    )
+                    # Optional overlays:
+                    # if uv is not None:
+                    #     draw_waypoint_icon(latestRgb, *uv, color=(0, 255, 255))
+                    # draw_wedge_arcs_on_image(latestRgb, ARCS_METERS, hfov_deg,
+                    #                          vfov_deg=RGB_VFOV_DEG, color=(200,200,200))
+                    # draw_ground_arcs_on_image(latestRgb, ARCS_METERS, N_UP_CAM,
+                    #                           hfov_deg, vfov_deg=RGB_VFOV_DEG, color=(200,200,200))
+
+                # Update matplotlib figure with both views
+                try:
+                    vis.update_image(latestRgb)  # Add camera view
+                    vis.update_plot(latestDets)   # Update scatter plot
                 except Exception:
-                    pass
-                vis.drawDetOnRgb(latestRgb, det, w, h)
+                    # Matplotlib window was closed, exit gracefully
+                    break
 
-            # Waypoint + (optional) FOV/ground-aware arcs on the NN view
-            if img_w is not None:
-                uv = project_point_to_pixels(
-                    WAYPOINT_X_M, WAYPOINT_Y_M, WAYPOINT_Z_M,
-                    img_w, img_h, hfov_deg, vfov_deg=RGB_VFOV_DEG
-                )
-                # Optional overlays:
-                # if uv is not None:
-                #     draw_waypoint_icon(latestRgb, *uv, color=(0, 255, 255))
-                # draw_wedge_arcs_on_image(latestRgb, ARCS_METERS, hfov_deg,
-                #                          vfov_deg=RGB_VFOV_DEG, color=(200,200,200))
-                # draw_ground_arcs_on_image(latestRgb, ARCS_METERS, N_UP_CAM,
-                #                           hfov_deg, vfov_deg=RGB_VFOV_DEG, color=(200,200,200))
+            # Check for quit key or if matplotlib window is closed
+            if cv2.waitKey(1) == ord('q'):
+                break
+            if not plt.fignum_exists(vis.fig.number):
+                break
 
-            # Show windows
-            # cv2.imshow("depth", depthColor)
-            cv2.imshow("rgb", latestRgb)
-
-            # Update X–Z map
-            vis.update_plot(latestDets)
-
-        if cv2.waitKey(1) == ord('q'):
-            break
-
-cv2.destroyAllWindows()
-plt.close('all')
+    except KeyboardInterrupt:
+        print("\nInterrupted by user")
+    finally:
+        cv2.destroyAllWindows()
+        plt.ioff()
+        if plt.fignum_exists(vis.fig.number):
+            plt.close(vis.fig)

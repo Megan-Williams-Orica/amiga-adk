@@ -52,7 +52,7 @@ def _poses_from_csv(csv_path: Path) -> dict[int, Pose3F64]:
 
     # ENU -> NWU: north = dy, west = -dx
     north = df["dy"].astype(float).to_numpy()
-    west = (-df["dx"].astype(float)).to_numpy()
+    west = (-df["dx"].astype(float)).to_numpy() # may require a negative sign
 
     # Yaw: prefer yaw_deg column; else infer from consecutive points (path tangent).
     if "yaw_deg" in df.columns:
@@ -148,6 +148,7 @@ class MotionPlanner:
     ):
         self.client = client
         self.waypoints: Dict[int, Pose3F64] = {}
+        self.original_csv_waypoints: Dict[int, Pose3F64] = {}  # Store original CSV waypoints for vision search zones
         self.last_row_waypoint_index = last_row_waypoint_index
         self.row_spacing = row_spacing
         self.headland_buffer = headland_buffer
@@ -179,8 +180,12 @@ class MotionPlanner:
         # Load tool offsets
         self.tool_offset = self._load_tool_offset(tool_config_path)
 
+        # Store UNTRANSFORMED waypoints for vision search zone validation
+        # (Cones are placed at surveyed waypoint locations, NOT at robot target positions)
+        self.original_csv_waypoints = waypoints_dict.copy()
+
         # Transform hole coordinates to robot coordinates
-        self.waypoints = self._transform_holes_to_robot_poses(waypoints_dict)
+        self.waypoints = self._transform_holes_to_robot_poses(waypoints_dict.copy())
 
         self.pose_query_task = asyncio.create_task(self._update_current_pose())
 
@@ -546,7 +551,7 @@ class MotionPlanner:
 
         # Check if we're completing a row end maneuver
         if self.current_waypoint_index == self.last_row_waypoint_index:
-            # In this case, we need to check if we are the the last waypoint of the first row (i.e., row end index == 1)
+            # In this case, we need to check if we are the last waypoint of the first row (i.e., row end index == 1)
             # Or if we have already completed the row end maneuvers and want to go again to the first waypoint
             # of the next row
             if self.row_end_segment_index == 1:
