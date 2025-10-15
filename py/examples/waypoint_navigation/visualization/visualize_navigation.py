@@ -37,22 +37,27 @@ import numpy as np
 class PostProcessingVisualizer:
     """Post-processing visualizer for completed navigation sessions."""
 
-    def __init__(self, waypoints_path: Path, navigation_progress_path: Path = None, robot_positions_path: Path = None):
+    def __init__(self, waypoints_path: Path, navigation_progress_path: Path = None, robot_positions_path: Path = None, cone_detections_path: Path = None, search_radius: float = 1.0):
         """Initialize the visualizer.
 
         Args:
             waypoints_path: Path to the surveyed waypoints JSON file
             navigation_progress_path: Path to navigation_progress.json (optional)
             robot_positions_path: Path to robot_positions.json (optional)
+            cone_detections_path: Path to cone_detections.json (optional)
+            search_radius: Search radius around CSV waypoints in meters (default: 1.0)
         """
         self.waypoints_path = waypoints_path
         self.navigation_progress_path = navigation_progress_path or Path("navigation_progress.json")
         self.robot_positions_path = robot_positions_path or Path("robot_positions.json")
+        self.cone_detections_path = cone_detections_path or Path("cone_detections.json")
+        self.search_radius = search_radius
 
         # Data storage
         self.surveyed_waypoints = []
         self.track_segments = {}
         self.robot_positions = []
+        self.cone_detections = []
 
         # Coordinate normalization
         self.x_offset = 0
@@ -86,6 +91,7 @@ class PostProcessingVisualizer:
         self._load_surveyed_waypoints()
         self._load_track_segments()
         self._load_robot_positions()
+        self._load_cone_detections()
 
     def _load_surveyed_waypoints(self):
         """Load surveyed waypoints from JSON file."""
@@ -125,6 +131,19 @@ class PostProcessingVisualizer:
             print(f"❌ Failed to load robot positions: {e}")
             self.robot_positions = []
 
+    def _load_cone_detections(self):
+        """Load cone detections from cone_detections.json."""
+        try:
+            if self.cone_detections_path.exists():
+                with open(self.cone_detections_path, 'r') as f:
+                    self.cone_detections = json.load(f)
+                print(f"✅ Loaded {len(self.cone_detections)} cone detections")
+            else:
+                print(f"⚠️  Cone detections file not found: {self.cone_detections_path}")
+        except Exception as e:
+            print(f"❌ Failed to load cone detections: {e}")
+            self.cone_detections = []
+
     def _calculate_offsets(self):
         """Calculate offsets to normalize coordinates to smaller, more readable values."""
         all_x = []
@@ -144,6 +163,10 @@ class PostProcessingVisualizer:
         if self.robot_positions:
             all_x.extend([pos['x'] for pos in self.robot_positions])
             all_y.extend([pos['y'] for pos in self.robot_positions])
+
+        if self.cone_detections:
+            all_x.extend([cone['x'] for cone in self.cone_detections])
+            all_y.extend([cone['y'] for cone in self.cone_detections])
 
         if all_x and all_y:
             # Use the minimum values as offsets to shift coordinates closer to origin
@@ -223,6 +246,14 @@ class PostProcessingVisualizer:
             survey_x, survey_y, survey_headings = self.unpack_surveyed_waypoints()
             norm_x, norm_y = self._normalize_coords(survey_x, survey_y)
 
+            # Plot search radius circles around CSV waypoints
+            for x, y in zip(norm_x, norm_y):
+                search_circle = plt.Circle((x, y), self.search_radius, color='blue', alpha=0.1, fill=True, linestyle='--', linewidth=1.5, zorder=1)
+                plt.gca().add_patch(search_circle)
+                # Add circle outline
+                outline_circle = plt.Circle((x, y), self.search_radius, color='blue', alpha=0.3, fill=False, linestyle='--', linewidth=1.5, zorder=1)
+                plt.gca().add_patch(outline_circle)
+
             # Plot the holes as circles (10 inches = 25.4 cm diameter)
             hole_radius_m = 0.254 / 2  # 10 inches = 25.4 cm, radius = 12.7 cm
             for x, y in zip(norm_x, norm_y):
@@ -231,8 +262,9 @@ class PostProcessingVisualizer:
                 # Add hole center point
                 plt.scatter(x, y, c='red', marker='+', s=50, linewidth=2, zorder=5, alpha=0.8)
 
-            # Add legend entry for holes
+            # Add legend entries
             plt.scatter([], [], c='red', marker='o', s=100, alpha=0.3, label='10" Target Holes', edgecolors='red')
+            plt.scatter([], [], c='blue', marker='o', s=100, alpha=0.1, label=f'Search Radius ({self.search_radius}m)', edgecolors='blue')
 
             if show_waypoint_numbers:
                 for i, (x, y) in enumerate(zip(norm_x, norm_y)):
@@ -354,6 +386,31 @@ class PostProcessingVisualizer:
                         zorder=5,
                     )
 
+        # Plot cone detections (orange dots)
+        if self.cone_detections:
+            cone_x = [cone['x'] for cone in self.cone_detections]
+            cone_y = [cone['y'] for cone in self.cone_detections]
+            norm_cone_x, norm_cone_y = self._normalize_coords(cone_x, cone_y)
+
+            plt.scatter(
+                norm_cone_x, norm_cone_y, c='orange', marker='o', s=80, label='Cone Detections',
+                edgecolors='darkorange', linewidth=2, alpha=0.9, zorder=7
+            )
+
+            # Add confidence labels to cone detections
+            for i, cone in enumerate(self.cone_detections):
+                conf = cone.get('confidence', 0.0)
+                plt.annotate(
+                    f'{conf:.2f}',
+                    (norm_cone_x[i], norm_cone_y[i]),
+                    xytext=(5, 5),
+                    textcoords='offset points',
+                    fontsize=7,
+                    color='darkorange',
+                    fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.2', facecolor='white', alpha=0.7),
+                )
+
         plt.axis('equal')
 
         # Add fine grid for precision analysis (10 cm = 0.1 m grid)
@@ -388,7 +445,7 @@ class PostProcessingVisualizer:
         plt.text(
             0.02,
             0.98,
-            f"Track Segments: {len(self.track_segments)}\nRobot Positions: {len(self.robot_positions)}",
+            f"Track Segments: {len(self.track_segments)}\nRobot Positions: {len(self.robot_positions)}\nCone Detections: {len(self.cone_detections)}",
             transform=plt.gca().transAxes,
             fontsize=10,
             verticalalignment='top',
@@ -566,6 +623,20 @@ def main():
     )
 
     parser.add_argument(
+        "--cone-detections",
+        type=Path,
+        default=Path("cone_detections.json"),
+        help="Path to cone_detections.json file (default: cone_detections.json)",
+    )
+
+    parser.add_argument(
+        "--search-radius",
+        type=float,
+        default=1.0,
+        help="Search radius around CSV waypoints in meters (default: 1.0)",
+    )
+
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=Path("navigation_plots"),
@@ -599,6 +670,8 @@ def main():
         waypoints_path=args.waypoints_path,
         navigation_progress_path=args.navigation_progress,
         robot_positions_path=args.robot_positions,
+        cone_detections_path=args.cone_detections,
+        search_radius=args.search_radius,
     )
 
     # Generate comprehensive overview

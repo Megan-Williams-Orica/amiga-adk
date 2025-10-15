@@ -57,8 +57,8 @@ class NavigationManager:
         self.curr_segment_name: str = "start"
         self.no_stop = no_stop
         self.actuator = actuator or NullActuator()
-        self.vision_active = False
         self.actuator_deploying = False
+        self.track_executing = False  # Track if robot is actively executing a track segment
         self._controller_lock = getattr(self, "_controller_lock", asyncio.Lock())
 
 
@@ -128,10 +128,6 @@ class NavigationManager:
         logger.info(
             f"Setting track with {len(track.waypoints)} waypoints...")
         try:
-            # await self.controller_client.request_reply("/set_track", TrackFollowRequest(track=track))
-            if getattr(self, "vision_active", False):
-                # let vision finish its cancel→set→start
-                await asyncio.sleep(0.05)
             await self._set_track_locked(track)
             logger.info("SUCCESS: Track set")
         except Exception as e:
@@ -183,10 +179,6 @@ class NavigationManager:
         """Start following the currently set track."""
         logger.info("Starting track following...")
         try:
-            # await self.controller_client.request_reply("/start", Empty())
-            if getattr(self, "vision_active", False):
-                # let vision finish its cancel→set→start
-                await asyncio.sleep(0.05)
             await self._start_following_locked()
             logger.info("START: Track following")
         except Exception as e:
@@ -303,11 +295,6 @@ class NavigationManager:
             logger.error(f"ERROR when shutting down motion planner: {e}")
 
         logger.info("Cleanup completed")
-
-    async def _hold_if_vision_active(self) -> None:
-        """Pause row/waypoint progression while a vision override is running."""
-        while self.vision_active and not self.shutdown_requested:
-            await asyncio.sleep(0.05)
 
     async def _wait_for_cone_or_skip(self) -> bool:
         """
@@ -431,12 +418,18 @@ class NavigationManager:
         self.track_failed_event.clear()
 
         try:
+            # Set flag to prevent vision from overriding waypoints during execution
+            self.track_executing = True
+
             await self.set_track(track)
             await asyncio.sleep(1.0)  # ensure track is set
             # TODO: Add IMUjiggle function
             await self.start_following()
 
             success = await self.wait_for_track_completion(timeout)
+
+            # Clear flag after track execution completes (before deployment)
+            self.track_executing = False
 
             if success:
                 logger.info("SUCCESS: Track segment completed")
@@ -482,6 +475,9 @@ class NavigationManager:
         except Exception as e:
             logger.error(f"ERROR: executing track: {e}")
             return False
+        finally:
+            # Ensure flag is cleared even if an exception occurs
+            self.track_executing = False
 
     async def run_navigation(self) -> None:
         """Run the complete waypoint navigation sequence."""
@@ -495,17 +491,14 @@ class NavigationManager:
                 if self.shutdown_requested:
                     logger.info("Shutdown requested, stopping navigation")
                     break
-                
-                await self._hold_if_vision_active()
+
                 user_choice: str = self.get_user_choice()
 
                 if user_choice == "quit":
                     logger.info("User requested quit, stopping navigation")
                     self.shutdown_requested = True
                     break
-                
-                # Respect any vision override before (re)planning
-                await self._hold_if_vision_active()
+
                 if user_choice == "redo":
                     logger.info(
                         "Redoing last segment with recalculated path...")
@@ -547,23 +540,8 @@ class NavigationManager:
                     # Reset flag for next waypoint
                     self.cone_detected_for_current_wp = False
 
-                # IMPORTANT: Check if vision will execute BEFORE checking vision_active
-                # Vision sets vision_executed_segment first, then vision_active
-                # If we check vision_active first, we might start executing before vision sets it
-                if getattr(self, "vision_executed_segment", False):
-                    logger.info("[VISION] Vision will execute this segment - skipping main navigation execution")
-                    self.vision_executed_segment = False  # Reset for next segment
-
-                    # Wait for vision to complete execution before continuing
-                    logger.info("[VISION] Waiting for vision execution to complete...")
-                    await self._hold_if_vision_active()
-                    logger.info("[VISION] Vision execution complete")
-
-                    success = True
-                else:
-                    # Don't launch execution while vision overrides are active
-                    await self._hold_if_vision_active()
-                    success = await self.execute_single_track(track_segment)
+                # Execute the track segment (vision may have overridden the waypoint position)
+                success = await self.execute_single_track(track_segment)
 
                 failed_attempts: int = 0
 

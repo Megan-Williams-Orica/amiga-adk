@@ -86,7 +86,7 @@ def _update_pose_from_filter(filter_msg) -> None:
     set_latest_pose(x_m, y_m, yaw_rad)
         
 # Vision configuration
-VISION_SEARCH_RADIUS_M = 2.0  # Search radius around CSV waypoints for cone detection
+VISION_SEARCH_RADIUS_M = 1.0  # Search radius around CSV waypoints for cone detection
 VISION_WAIT_TIMEOUT_S = 10.0  # How long to wait for cone detection before skipping waypoint
 
 def is_vision_enabled() -> bool:
@@ -106,72 +106,18 @@ def is_vision_enabled() -> bool:
 # TODO: Refactor into a separate module
 async def vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=2.0):
     """
-    Listens for UDP 'cone_goal' messages and overrides the follower by:
-      /cancel -> /set_track (short vision track) -> /start
-    Now also /pause if auto mode is disabled (robot not controllable).
+    Listens for UDP 'cone_goal' messages from detectionPlot.py and overrides waypoint positions.
 
-    When vision is enabled (detectionPlot.py is sending messages):
-    - CSV waypoints act as 'search zones' with radius VISION_SEARCH_RADIUS_M
-    - Only cones detected within the search radius of the current CSV waypoint are accepted
-    - Robot will wait/skip waypoint if no cone is detected in the zone
+    When vision is enabled (detectionPlot.py is running):
+    - CSV waypoints act as 'search zone centers' with radius VISION_SEARCH_RADIUS_M
+    - When a cone is detected within the search radius, the waypoint position is overridden
+      with the actual cone location
+    - Navigation manager handles all execution, deployment, and state management
+    - Robot drives to cones instead of CSV waypoints when vision is enabled
+
+    When vision is disabled:
+    - Robot drives directly to CSV waypoint positions (normal behavior)
     """
-
-    # --- helpers ------------------------------------------------------------
-    async def get_state() -> TrackFollowerState:
-        return await controller_client.request_reply("/get_state", Empty(), decode=True)
-
-    # True if the follower is in any terminal state (COMPLETE / ABORTED / FAILED)
-    def _is_terminal(st: TrackFollowerState) -> bool:
-        return st.status.track_status in (
-            TrackStatusEnum.TRACK_COMPLETE,
-            TrackStatusEnum.TRACK_ABORTED,
-            TrackStatusEnum.TRACK_FAILED,
-        )
-       
-    # Pulls robot_status.controllable from the state (i.e., AUTO mode enabled and no safety fault).
-    def controllable_from_state(st) -> bool:
-        rs = getattr(st, "robot_status", None)
-        return bool(getattr(rs, "controllable", False))
- 
-    async def wait_until(pred, timeout: float, poll_s: float = 0.05):
-        """
-        Poll follower state until pred(state) is True, or timeout elapses.
-        Assumes get_state() returns a decoded TrackFollowerState (decode=True).
-        """
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + timeout
-
-        # initial sample
-        st = await get_state()  # TrackFollowerState
-        while not pred(st):
-            if loop.time() >= deadline:
-                raise TimeoutError("wait condition not met")
-
-            await asyncio.sleep(poll_s)
-
-            try:
-                st = await get_state()  # keep sampling
-                if st is None:
-                    # extremely defensive: treat as transient failure
-                    continue
-            except Exception as e:
-                # transient RPC/wire hiccup; keep trying until deadline
-                # (optionally log: print(f"[VISION] get_state failed: {e}"))
-                continue
-
-        return st
-
-
-    # One mutex to rule all controller RPCs (prevents races with nav loop)
-    if not hasattr(nav_manager, "_controller_lock"):
-        nav_manager._controller_lock = asyncio.Lock()
-    ctl_lock: asyncio.Lock = nav_manager._controller_lock
-
-    # Latch state on the nav_manager object so it's visible across loops
-    if not hasattr(nav_manager, "vision_latched"):
-        nav_manager.vision_latched = False
-    if not hasattr(nav_manager, "vision_latch_deadline"):
-        nav_manager.vision_latch_deadline = 0.0
 
     # Track when cone was last detected in search zone for current waypoint
     if not hasattr(nav_manager, "cone_detected_for_current_wp"):
@@ -183,7 +129,9 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
     if not hasattr(nav_manager, "vision_completed_waypoints"):
         nav_manager.vision_completed_waypoints = set()
 
-    LATCH_MAX_S = 20.0  # safety timeout for a vision retarget (tune as you like)
+    # Track all cone detections for visualization
+    if not hasattr(nav_manager, "cone_detections"):
+        nav_manager.cone_detections = []
 
     # --- socket setup -------------------------------------------------------
     loop = asyncio.get_running_loop()
@@ -202,30 +150,7 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
 
     try:
         while True:
-            # --- while latched, just watch state and drop messages ---
-            if nav_manager.vision_latched:
-                # auto-unlatch on terminal state or timeout
-                try:
-                    st = await get_state()
-                    if _is_terminal(st) or (asyncio.get_event_loop().time() >= nav_manager.vision_latch_deadline):
-                        print("[VISION] unlatching (terminal state or timeout)")
-                        nav_manager.vision_latched = False
-                        # small grace to avoid immediate re-trigger on the same frame
-                        await asyncio.sleep(0.2)
-                except Exception:
-                    # if state read hiccups, keep latch until deadline
-                    pass
-
-                # drain/ignore incoming UDP quickly, then continue loop
-                try:
-                    _ = await asyncio.wait_for(
-                        asyncio.get_running_loop().run_in_executor(None, sock.recvfrom, 4096), timeout=0.01
-                    )
-                except Exception:
-                    await asyncio.sleep(0.03)
-                continue
-
-            # ---- receive next message (non-latched path) ----
+            # ---- receive next message ----
             try:
                 data, _ = await loop.run_in_executor(None, sock.recvfrom, 4096)
             except socket.timeout:
@@ -269,13 +194,13 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                 """
                 Calculate distance from detected cone to the ORIGINAL CSV waypoint.
                 This is used to validate if the cone is within the search zone.
-                The search zone is centered at current_waypoint_index (the target we're executing).
+                The search zone is centered at the NEXT waypoint (the target we're about to execute).
                 """
-                # Get the original CSV waypoint for the CURRENT target waypoint
-                # After _create_ab_segment_to_next_waypoint() increments the index,
-                # current_waypoint_index already points to the target waypoint
+                # Get the original CSV waypoint for the NEXT target waypoint
+                # Since _create_ab_segment_to_next_waypoint() increments BEFORE building,
+                # the target waypoint is current_waypoint_index + 1
                 csv_waypoint = None
-                idx = max(1, motion_planner.current_waypoint_index)
+                idx = max(1, motion_planner.current_waypoint_index + 1)
 
                 if hasattr(motion_planner, "original_csv_waypoints"):
                     csv_waypoint = motion_planner.original_csv_waypoints.get(idx)
@@ -337,9 +262,14 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                 continue
 
             # ---- Check if we've already processed this waypoint ----
-            current_wp_idx = motion_planner.current_waypoint_index
-            if current_wp_idx in nav_manager.vision_completed_waypoints:
-                print(f"[VISION] skip: waypoint {current_wp_idx} already processed by vision")
+            # The NEXT waypoint (target) is current_waypoint_index + 1 (before increment)
+            # Or if we're already incremented, it's the current index
+            # To determine which waypoint we're targeting, we need to look at what
+            # `next_track_segment()` would build. Since `_create_ab_segment_to_next_waypoint()`
+            # increments BEFORE building, the target is current_waypoint_index + 1
+            target_wp_idx = motion_planner.current_waypoint_index + 1
+            if target_wp_idx in nav_manager.vision_completed_waypoints:
+                print(f"[VISION] skip: waypoint {target_wp_idx} already processed by vision")
                 continue
 
             # ---- debounce ----
@@ -350,145 +280,47 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                     print(f"[VISION] skip: debounce (moved={moved:.2f}, dt={now-last_sent_t:.2f})")
                     continue
 
-            # ---- don't stack overrides ----
-            if getattr(nav_manager, "vision_active", False):
-                print("[VISION] skip: vision_active already true")
+            # ---- Check if we've already overridden this waypoint ----
+            if target_wp_idx in nav_manager.vision_completed_waypoints:
+                print(f"[VISION] skip: waypoint {target_wp_idx} already overridden")
                 continue
 
-            # --- Build track directly to detected cone (robot-relative coordinates) ---
+            # ---- Check if track is currently executing ----
+            # Only allow waypoint overrides when robot is between segments
+            if getattr(nav_manager, "track_executing", False):
+                print("[VISION] skip: track currently executing, waiting for segment completion")
+                continue
+
+            # --- Override waypoint position with cone location ---
             try:
+                # Override the next waypoint position with the detected cone position
+                modified_idx = await motion_planner.override_next_waypoint_world_xy(X_obj, Y_obj, yaw_rad=None)
+                print(f"[VISION] Overrode waypoint {modified_idx} position to cone at ({X_obj:.2f}, {Y_obj:.2f})")
+
                 # Mark that we detected a valid cone for the current waypoint
                 nav_manager.cone_detected_for_current_wp = True
+                nav_manager.vision_completed_waypoints.add(target_wp_idx)
 
-                # IMPORTANT: Set vision_active FIRST before vision_executed_segment
-                # This ensures the navigation manager will properly wait for vision to complete
-                # If we set vision_executed_segment before vision_active, the navigation manager
-                # will see vision_executed_segment=True but vision_active=False, causing it to
-                # continue to the next segment before vision actually starts executing
-                if hasattr(nav_manager, "vision_active"):
-                    nav_manager.vision_active = True
+                # Log cone detection for visualization
+                cone_detection_record = {
+                    "x": X_obj,
+                    "y": Y_obj,
+                    "waypoint_index": target_wp_idx,
+                    "confidence": conf,
+                    "robot_x": xr,
+                    "robot_y": yr,
+                    "robot_heading": yaw
+                }
+                nav_manager.cone_detections.append(cone_detection_record)
+                logger.info(f"[VISION] Cone detected at ({X_obj:.2f}, {Y_obj:.2f}) for waypoint {target_wp_idx}, nav manager will execute track")
 
-                # Mark that vision will execute this segment (so main loop should skip execution)
-                nav_manager.vision_executed_segment = True
-                # Mark this waypoint as completed by vision to prevent re-triggering
-                nav_manager.vision_completed_waypoints.add(current_wp_idx)
-                logger.info(f"[VISION] Valid cone detected in search zone - building track to cone at ({x:.2f}m fwd, {y:.2f}m left)")
-
-                # Build track using robot-relative coordinates (CSV waypoints unchanged!)
-                track_to_cone, goal_pose = await motion_planner.build_track_to_robot_relative_goal(
-                    x_fwd_m=x, y_left_m=y, standoff_m=0.75, spacing=0.1
-                )
-                print(f"[VISION] Built track to cone with {len(track_to_cone.waypoints)} waypoints")
+                # Update last goal for debouncing
+                last_goal = (x, y)
+                last_sent_t = now
 
             except Exception as e:
-                print(f"[VISION] Failed to build track to cone: {e}")
-                # Reset vision_active if we failed to build track
-                if hasattr(nav_manager, "vision_active"):
-                    nav_manager.vision_active = False
+                print(f"[VISION] Failed to override waypoint: {e}")
                 continue
-
-            print("[VISION] OK → cancel + set_track + start (driving to cone)")
-
-            # Activate latch to lock onto cone
-            nav_manager.vision_latched = True
-            nav_manager.vision_latch_deadline = asyncio.get_event_loop().time() + LATCH_MAX_S
-            print(f"[VISION] latched on target for up to {LATCH_MAX_S:.1f} s")
-
-            try:
-                async with ctl_lock:
-                    # Get current state
-                    st = await get_state()
-
-                    # If currently following a track, pause it
-                    if st.status.track_status == TrackStatusEnum.TRACK_FOLLOWING:
-                        try:
-                            await controller_client.request_reply("/pause", Empty())
-                            print("[VISION] paused current track")
-                        except Exception as e:
-                            print(f"[VISION] pause failed: {e}")
-
-                    # C) Cancel current track
-                    try:
-                        await controller_client.request_reply("/cancel", Empty())
-                    except Exception:
-                        pass
-
-                    # D) Wait until not FOLLOWING
-                    try:
-                        await wait_until(lambda s: s.status.track_status != TrackStatusEnum.TRACK_FOLLOWING, timeout=3.0)
-                    except TimeoutError:
-                        print("[VISION] warn: still FOLLOWING after cancel; proceeding anyway")
-
-                    # E) Set track to cone and start
-                    req = TrackFollowRequest(track=track_to_cone)
-                    await controller_client.request_reply("/set_track", req)
-                    await wait_until(lambda s: s.status.track_status == TrackStatusEnum.TRACK_LOADED, timeout=2.0)
-                    await controller_client.request_reply("/start", Empty())
-
-                    print("[VISION] Track started - driving to cone")
-
-                    # F) Wait for track to cone to complete
-                    st = await wait_until(lambda s: _is_terminal(s), timeout=30.0)
-
-                    if st.status.track_status == TrackStatusEnum.TRACK_COMPLETE:
-                        print("[VISION] Successfully reached cone")
-
-                        # G) Execute full deployment sequence
-                        if nav_manager.actuator_enabled:
-                            nav_manager.actuator_deploying = True
-                            try:
-                                from utils.canbus import trigger_dipbob
-
-                                # Wait briefly before deployment
-                                await asyncio.sleep(2.0)
-
-                                # Deploy dipbob
-                                await trigger_dipbob("can0")
-                                logger.info("[VISION] Deploying dipbob")
-                                await asyncio.sleep(3.0)
-
-                                # Move forward (tool_to_origin) so robot center is over hole
-                                origin_track = await motion_planner.create_tool_to_origin_segment()
-                                req = TrackFollowRequest(track=origin_track)
-                                await controller_client.request_reply("/set_track", req)
-                                await wait_until(lambda s: s.status.track_status == TrackStatusEnum.TRACK_LOADED, timeout=2.0)
-                                await controller_client.request_reply("/start", Empty())
-                                await wait_until(lambda s: _is_terminal(s), timeout=15.0)
-
-                                logger.info("[VISION] Tool-to-origin move complete")
-
-                                # Open and close chute
-                                await nav_manager.actuator.pulse_sequence(
-                                    open_seconds=nav_manager.actuator_open_seconds,
-                                    close_seconds=nav_manager.actuator_close_seconds,
-                                    rate_hz=nav_manager.actuator_rate_hz,
-                                    settle_before=3.0,
-                                    settle_between=0.0,
-                                    wait_for_enter_between=False,
-                                    enter_prompt="Hole measured. Press ENTER to close the chute...",
-                                    enter_timeout=30.0,
-                                )
-                                logger.info("[VISION] Deployment sequence complete")
-
-                                # NOTE: Do NOT increment waypoint index here!
-                                # The motion planner already increments when creating the next track segment.
-                                # Double-incrementing would cause waypoints to be skipped.
-
-                            finally:
-                                nav_manager.actuator_deploying = False
-                    else:
-                        print(f"[VISION] Track to cone failed with status {st.status.track_status}")
-
-            except TimeoutError as e:
-                print(f"[VISION] Timeout during cone approach: {e}")
-            except Exception as e:
-                print(f"[VISION] Error during cone approach/deployment: {e}")
-                import traceback
-                traceback.print_exc()
-            finally:
-                if hasattr(nav_manager, "vision_active"):
-                    nav_manager.vision_active = False
-                await asyncio.sleep(0.1)
 
     except asyncio.CancelledError:
         pass
@@ -600,6 +432,17 @@ async def main(args) -> None:
             logger.info(f"Robot positions saved to {positions_path}")
         except Exception as e:
             logger.error(f"FAILED to save robot positions: {e}")
+
+        # Save cone detections
+        cone_detections_path = Path("./visualization/cone_detections.json")
+        try:
+            cone_detections_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cone_detections_path, "w") as f:
+                json.dump(
+                    getattr(nav_manager, "cone_detections", []), f, indent=2)
+            logger.info(f"Cone detections saved to {cone_detections_path}")
+        except Exception as e:
+            logger.error(f"FAILED to save cone detections: {e}")
 
         if nav_manager and not nav_manager.shutdown_requested:
             await nav_manager._cleanup()
