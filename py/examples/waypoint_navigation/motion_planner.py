@@ -272,11 +272,14 @@ class MotionPlanner:
 
     async def override_next_waypoint_world_xy(self, X_w: float, Y_w: float, yaw_rad: float | None = None) -> int:
         """
-        Replace the *next* waypoint with a world pose at (X_w, Y_w). Heading defaults to current robot yaw.
+        Replace the current target waypoint with a world pose at (X_w, Y_w). Heading defaults to current robot yaw.
         Returns the waypoint index that was modified.
+
+        Since _create_ab_segment_to_next_waypoint() increments current_waypoint_index BEFORE building the track,
+        current_waypoint_index already points to the waypoint we're currently navigating toward.
         """
-        # Determine which waypoint to replace (the "next" one)
-        idx = max(1, (self.current_waypoint_index or 0) + 1)
+        # Determine which waypoint to replace (the current target)
+        idx = max(1, self.current_waypoint_index)
 
         # Use current heading if none provided
         if yaw_rad is None:

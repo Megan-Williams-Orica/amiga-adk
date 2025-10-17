@@ -322,8 +322,9 @@ class NavigationManager:
             logger.info("[VISION] Vision not enabled (detectionPlot.py not running), proceeding to CSV waypoint")
             return True  # Vision not enabled, proceed to CSV waypoint immediately
 
-        # Vision is enabled - reset cone detection flag for new waypoint
-        self.cone_detected_for_current_wp = False
+        # Vision is enabled - only reset cone detection flag if not already detected (avoid race condition)
+        if not getattr(self, "cone_detected_for_current_wp", False):
+            self.cone_detected_for_current_wp = False
         self.current_waypoint_start_time = asyncio.get_event_loop().time()
 
         logger.info("[VISION] Vision enabled - waiting indefinitely for cone detection in search zone...")
@@ -519,7 +520,6 @@ class NavigationManager:
                     f"Got track segment '{segment_name}' with {len(track_segment.waypoints)} waypoints"
                 )
                 self.curr_segment_name = segment_name
-                self.navigation_progress[segment_name] = track_segment
 
                 segment_count += 1
                 logger.info(
@@ -537,8 +537,18 @@ class NavigationManager:
                         # Shutdown was requested during wait
                         break
 
+                    # Rebuild track if vision overrode the waypoint position
+                    # Vision system calls override_next_waypoint_world_xy() which modifies motion_planner.waypoints
+                    # but doesn't rebuild the track, so we need to rebuild it here
+                    if getattr(self, "cone_detected_for_current_wp", False):
+                        logger.info("[VISION] Rebuilding track with vision-overridden waypoint position")
+                        track_segment, _ = await self.motion_planner.redo_last_segment()
+
                     # Reset flag for next waypoint
                     self.cone_detected_for_current_wp = False
+
+                # Save track to navigation progress
+                self.navigation_progress[segment_name] = track_segment
 
                 # Execute the track segment (vision may have overridden the waypoint position)
                 success = await self.execute_single_track(track_segment)

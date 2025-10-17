@@ -21,6 +21,7 @@ from utils.pose_cache import get_latest_pose, set_latest_pose
 
 # ---------------- Model / rates ----------------
 modelDescription = dai.NNModelDescription("luxonis/ppe-detection:640x640")
+
 FPS = 15
 
 # ---------------- Camera / FOV ----------------
@@ -48,7 +49,7 @@ N_UP_CAM /= (np.linalg.norm(N_UP_CAM) + 1e-9)
 KEEP_HISTORY   = False
 MAX_RANGE_M_Z  = 10.0   # forward axis [m] for scatter view bounds
 MAX_RANGE_M_X  = 5.0    # lateral axis [m] for scatter view bounds
-PLOT_REFRESH_S = 0.03
+PLOT_REFRESH_S = 1  # Increased from 0.03 to reduce matplotlib overhead
 
 # ---------------- Range arcs (meters) ----------------
 ARCS_METERS = [1.0, 2.0, 3.0, 4.0, 6.0]
@@ -276,10 +277,15 @@ class SpatialVisualizer:
         self.hist_x, self.hist_z = [], []
 
         # Waypoint marker on the X–Z map (camera-frame coordinates)
-        self.waypoint_handle = self.ax.scatter([WAYPOINT_X_M], [WAYPOINT_Z_M], marker="X", s=90)
+        # self.waypoint_handle = self.ax.scatter([WAYPOINT_X_M], [WAYPOINT_Z_M], marker="X", s=90)
 
         self._last_plot = time.time()
         self.labelMap = []
+
+        # FPS tracking
+        self._frame_count = 0
+        self._fps_start_time = time.time()
+        self._current_fps = 0.0
 
     def _draw_fov_wedge(self):
         hfov = RGB_HFOV_DEG if USE_RGB_FOV else STEREO_HFOV_DEG
@@ -324,9 +330,14 @@ class SpatialVisualizer:
                 self.ax.text(0.05, r * 0.98, f"{int(r)} m", fontsize=9, alpha=0.8)
               
     def update_image(self, rgb_frame):
-          """Update the RGB camera subplot."""
+          """Update the RGB camera subplot with FPS counter."""
+          # Draw FPS on frame (will be updated from main loop)
+          frame_with_fps = rgb_frame.copy()
+          cv2.putText(frame_with_fps, f"FPS: {self._current_fps:.1f}", (10, 30),
+                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2)
+
           # Convert BGR (OpenCV) to RGB (matplotlib)
-          rgb = cv2.cvtColor(rgb_frame, cv2.COLOR_BGR2RGB)
+          rgb = cv2.cvtColor(frame_with_fps, cv2.COLOR_BGR2RGB)
 
           if self.img_display is None:
               self.img_display = self.ax_img.imshow(rgb)
@@ -521,8 +532,8 @@ sdn.input.setBlocking(False)
 sdn.setBoundingBoxScaleFactor(0.5)
 sdn.setDepthLowerThreshold(100)
 sdn.setDepthUpperThreshold(5000)
-sdn.setNumInferenceThreads(2)
-sdn.setNumNCEPerInferenceThread(1)
+# sdn.setNumInferenceThreads(2)
+# sdn.setNumNCEPerInferenceThread(1)
 
 # Links (request mono outputs, feed StereoDepth)
 monoL.requestOutput((640, 400)).link(stereo.left)
@@ -558,6 +569,10 @@ with pipeline:
     hfov_deg = RGB_HFOV_DEG if USE_RGB_FOV else STEREO_HFOV_DEG
     img_w = img_h = None
 
+    # FPS tracking for actual camera frames
+    frame_count = 0
+    fps_start_time = time.time()
+
     try:
         while pipeline.isRunning():
             depthMsg = drain_latest(qDepth)
@@ -573,6 +588,12 @@ with pipeline:
                 latestRgb = rgbMsg.getCvFrame()
                 if img_w is None:
                     img_h, img_w = latestRgb.shape[:2]
+
+                # Count every camera frame received
+                frame_count += 1
+                elapsed = time.time() - fps_start_time
+                if elapsed > 0:
+                    vis._current_fps = frame_count / elapsed
 
             if latestRgb is not None and latestDepth is not None:
                 depthColor = vis.processDepthFrame(latestDepth.copy())

@@ -194,13 +194,13 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                 """
                 Calculate distance from detected cone to the ORIGINAL CSV waypoint.
                 This is used to validate if the cone is within the search zone.
-                The search zone is centered at the NEXT waypoint (the target we're about to execute).
+                The search zone is centered at the current target waypoint.
                 """
-                # Get the original CSV waypoint for the NEXT target waypoint
+                # Get the original CSV waypoint for the current target waypoint
                 # Since _create_ab_segment_to_next_waypoint() increments BEFORE building,
-                # the target waypoint is current_waypoint_index + 1
+                # current_waypoint_index already points to the waypoint we're navigating toward
                 csv_waypoint = None
-                idx = max(1, motion_planner.current_waypoint_index + 1)
+                idx = max(1, motion_planner.current_waypoint_index)
 
                 if hasattr(motion_planner, "original_csv_waypoints"):
                     csv_waypoint = motion_planner.original_csv_waypoints.get(idx)
@@ -262,12 +262,8 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                 continue
 
             # ---- Check if we've already processed this waypoint ----
-            # The NEXT waypoint (target) is current_waypoint_index + 1 (before increment)
-            # Or if we're already incremented, it's the current index
-            # To determine which waypoint we're targeting, we need to look at what
-            # `next_track_segment()` would build. Since `_create_ab_segment_to_next_waypoint()`
-            # increments BEFORE building, the target is current_waypoint_index + 1
-            target_wp_idx = motion_planner.current_waypoint_index + 1
+            # target_wp_idx was already calculated by cone_distance_from_csv_waypoint() above
+            # and represents the CSV waypoint we're checking against
             if target_wp_idx in nav_manager.vision_completed_waypoints:
                 print(f"[VISION] skip: waypoint {target_wp_idx} already processed by vision")
                 continue
@@ -279,11 +275,6 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                 if moved < MIN_DIST_DELTA and (now - last_sent_t) < MIN_PERIOD_S:
                     print(f"[VISION] skip: debounce (moved={moved:.2f}, dt={now-last_sent_t:.2f})")
                     continue
-
-            # ---- Check if we've already overridden this waypoint ----
-            if target_wp_idx in nav_manager.vision_completed_waypoints:
-                print(f"[VISION] skip: waypoint {target_wp_idx} already overridden")
-                continue
 
             # ---- Check if track is currently executing ----
             # Only allow waypoint overrides when robot is between segments
