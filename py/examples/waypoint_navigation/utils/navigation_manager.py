@@ -526,8 +526,11 @@ class NavigationManager:
                     f"Executing track segment {segment_count} with {len(track_segment.waypoints)} waypoints"
                 )
 
+                # Determine if this is a waypoint segment (should deploy) vs turn/maneuver segment (no deployment)
+                is_waypoint_segment = "waypoint" in segment_name.lower() and "row_end" not in segment_name.lower()
+
                 # Check if this is a waypoint segment (not turn/approach) and wait for vision if enabled
-                if "waypoint" in segment_name.lower():
+                if is_waypoint_segment:
                     # Use _wait_for_cone_or_skip which checks if vision is enabled
                     # If vision is enabled: waits indefinitely for cone
                     # If vision is disabled: proceeds immediately to CSV waypoint
@@ -550,8 +553,8 @@ class NavigationManager:
                 # Save track to navigation progress
                 self.navigation_progress[segment_name] = track_segment
 
-                # Execute the track segment (vision may have overridden the waypoint position)
-                success = await self.execute_single_track(track_segment)
+                # Execute the track segment with deployment only for waypoint segments
+                success = await self.execute_single_track(track_segment, do_post_actions=is_waypoint_segment)
 
                 failed_attempts: int = 0
 

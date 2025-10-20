@@ -543,7 +543,6 @@ class MotionPlanner:
 
     async def redo_last_segment(self) -> Tuple[Optional[Track], Optional[str]]:
         """Redo the last segment.
-        NOTE: It does not work for row end maneuvers, only for AB segments.
 
         Returns:
             The last track segment (Track) and its name.
@@ -554,15 +553,16 @@ class MotionPlanner:
 
         # Check if we're completing a row end maneuver
         if self.current_waypoint_index == self.last_row_waypoint_index:
-            # In this case, we need to check if we are the last waypoint of the first row (i.e., row end index == 1)
-            # Or if we have already completed the row end maneuvers and want to go again to the first waypoint
-            # of the next row
+            # We're in the row-end maneuver sequence
             if self.row_end_segment_index == 1:
                 # We are about to switch to the next row, but we haven't started the row end maneuvers yet.
                 # So we just reset our index and let the motion planner handle the next segment.
                 self.current_waypoint_index -= 1
-            # else: In this case, we are already in the row end maneuvers and we just want to redo the last segment.
-            # Don't reset the index, because if so, we would end up repeating the row end maneuvers
+            else:
+                # We are already in the row end maneuvers and we need to redo the last segment.
+                # Decrement row_end_segment_index to re-execute the previous row-end maneuver
+                self.row_end_segment_index -= 1
+                logger.info(f"Redoing row end maneuver, decremented index to {self.row_end_segment_index}")
         else:  # We're not trying to switch rows, just redo the last AB segment
             self.current_waypoint_index -= 1
 
@@ -613,10 +613,15 @@ class MotionPlanner:
         if self.row_end_segment_index >= 5:
             logger.info(
                 "Finished all row end maneuvers, moving to the next row.")
-            seg_name = f"row_end_5_to_waypoint_{self.current_waypoint_index + 1}"
-            return (await self._create_ab_segment_to_next_waypoint(), seg_name)
+            # Use segment name without "row_end" to ensure deployment happens at first waypoint of next row
+            curr_index = self.current_waypoint_index
+            track = await self._create_ab_segment_to_next_waypoint()
+            next_index = self.current_waypoint_index
+            seg_name = f"waypoint_{curr_index}_to_{next_index}"
+            return (track, seg_name)
         else:
             # We need to return a segment from the row end maneuver
-            track_segment = await self._row_end_maneuver(self.row_end_segment_index)
+            current_index = self.row_end_segment_index
+            track_segment = await self._row_end_maneuver(current_index)
             self.row_end_segment_index += 1
-            return (track_segment, f"row_end_{self.row_end_segment_index}")
+            return (track_segment, f"row_end_{current_index}")
