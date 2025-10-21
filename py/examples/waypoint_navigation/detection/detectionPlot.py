@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# detectionPlot_v3.py — DepthAI v3 “latest-only” rendering with FOV overlay + waypoint icon + ground-aware range arcs
+# detectionPlot.py — Host-side YOLOE detection with spatial coordinates
 
 import cv2, time, math, sys
 import depthai as dai
@@ -7,7 +7,7 @@ import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional
 import json
 import socket
 import os
@@ -15,12 +15,23 @@ from farm_ng_core_pybind import Isometry3F64
 from farm_ng_core_pybind import Pose3F64
 from farm_ng_core_pybind import Rotation3F64
 
+# YOLO model
+try:
+    from ultralytics import YOLO
+    ULTRALYTICS_AVAILABLE = True
+except ImportError:
+    print("⚠️  Ultralytics not installed. Install with: pip install ultralytics")
+    ULTRALYTICS_AVAILABLE = False
+
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from utils.pose_cache import get_latest_pose, set_latest_pose
 
 
 # ---------------- Model / rates ----------------
-modelDescription = dai.NNModelDescription("luxonis/ppe-detection:640x640")
+MODEL_PATH = Path(__file__).parent / "yoloe-11s-seg.engine"
+CONF_THRESHOLD = 0.3
+IOU_THRESHOLD = 0.5
+IMG_SIZE = 640
 
 FPS = 15
 
@@ -62,6 +73,159 @@ WAYPOINT_Z_M =  2.32
 
 # OPTIONAL: lock to a specific device (MxID or name). Leave as "" to use default device.
 TARGET_DEVICE  = "14442C1001A528D700"  # or ""
+
+# Depth filtering
+DEPTH_LOWER_MM = 100
+DEPTH_UPPER_MM = 5000
+
+# ---------------- Depth utilities ----------------
+def get_depth_at_point(depth_frame: np.ndarray, x_norm: float, y_norm: float,
+                       radius: int = 3) -> Optional[float]:
+    """
+    Get depth value (mm) at normalized coordinates (0-1).
+    Uses median of small region around point for robustness.
+    Reduced from radius=5 to radius=3 for better spatial accuracy (7x7 vs 11x11 pixels).
+    """
+    h, w = depth_frame.shape
+    x_px = int(x_norm * w)
+    y_px = int(y_norm * h)
+
+    # Clamp to frame bounds
+    x_px = np.clip(x_px, radius, w - radius - 1)
+    y_px = np.clip(y_px, radius, h - radius - 1)
+
+    # Get median depth in small region
+    roi = depth_frame[y_px-radius:y_px+radius+1, x_px-radius:x_px+radius+1]
+    roi_valid = roi[roi > 0]  # Filter out invalid (0) depth values
+
+    if len(roi_valid) == 0:
+        return None
+
+    return float(np.median(roi_valid))
+
+
+def pixel_to_camera_coords(x_norm: float, y_norm: float, depth_mm: float,
+                          img_w: int, img_h: int, intrinsics: dict) -> np.ndarray:
+    """
+    Convert normalized pixel coords + depth to 3D camera coords (meters).
+    Camera frame: +X right, +Y down, +Z forward
+    """
+    # Convert to pixel coordinates
+    u = x_norm * img_w
+    v = y_norm * img_h
+
+    # Use actual camera intrinsics from calibration
+    fx = intrinsics['fx']
+    fy = intrinsics['fy']
+    cx = intrinsics['cx']
+    cy = intrinsics['cy']
+
+    # Depth in meters
+    z = depth_mm / 1000.0
+
+    # Unproject to 3D
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+
+    return np.array([x, y, z], dtype=float)
+
+
+# ---------------- YOLO Detection ----------------
+class HostYOLODetector:
+    """YOLOv8/v11 detection running on host GPU/CPU."""
+
+    def __init__(self, model_path: Path, conf: float = 0.3, iou: float = 0.5):
+        if not ULTRALYTICS_AVAILABLE:
+            raise ImportError("Ultralytics required. Install: pip install ultralytics")
+
+        self.model = YOLO(str(model_path))
+        self.conf = conf
+        self.iou = iou
+        self.class_names = self.model.names
+
+    def detect(self, frame: np.ndarray) -> List[dict]:
+        """Run detection on frame, return list of detections."""
+        results = self.model.predict(frame, conf=self.conf, iou=self.iou, verbose=False)
+
+        detections = []
+        h, w = frame.shape[:2]
+
+        for result in results:
+            boxes = result.boxes
+            for box in boxes:
+                xyxy = box.xyxy[0].cpu().numpy()
+                conf = float(box.conf[0])
+                cls_id = int(box.cls[0])
+
+                # Only keep class 0 detections (from visual prompting)
+                if cls_id != 0:
+                    continue
+
+                # Handle class name safely
+                if cls_id in self.class_names:
+                    label_name = self.class_names[cls_id]
+                else:
+                    label_name = f"class_{cls_id}"
+
+                xmin, ymin, xmax, ymax = xyxy
+                detections.append({
+                    'label_id': cls_id,
+                    'label_name': label_name,
+                    'confidence': conf,
+                    'xmin': xmin / w,
+                    'ymin': ymin / h,
+                    'xmax': xmax / w,
+                    'ymax': ymax / h,
+                })
+
+        return detections
+
+
+# ---------------- Detection with Depth ----------------
+class SpatialDetection:
+    """Detection with 3D coordinates from depth."""
+
+    def __init__(self, detection: dict, spatial_coords: np.ndarray):
+        self.label = detection['label_id']
+        self.label_name = detection['label_name']
+        self.confidence = detection['confidence']
+        self.xmin = detection['xmin']
+        self.ymin = detection['ymin']
+        self.xmax = detection['xmax']
+        self.ymax = detection['ymax']
+
+        # Spatial coordinates (camera frame, meters)
+        self.spatialCoordinates = type('obj', (object,), {
+            'x': spatial_coords[0] * 1000,  # Convert to mm for compatibility
+            'y': spatial_coords[1] * 1000,
+            'z': spatial_coords[2] * 1000,
+        })()
+
+
+def add_spatial_to_detections(detections: List[dict], depth_frame: np.ndarray,
+                               img_w: int, img_h: int, intrinsics: dict) -> List[SpatialDetection]:
+    """Add 3D spatial coordinates to detections using depth map."""
+    spatial_dets = []
+
+    for det in detections:
+        # Use center of bounding box
+        x_center = (det['xmin'] + det['xmax']) / 2.0
+        y_center = (det['ymin'] + det['ymax']) / 2.0
+
+        # Get depth at center
+        depth_mm = get_depth_at_point(depth_frame, x_center, y_center)
+
+        if depth_mm is None or depth_mm < DEPTH_LOWER_MM or depth_mm > DEPTH_UPPER_MM:
+            continue  # Skip detections with invalid depth
+
+        # Convert to 3D camera coordinates using actual calibration
+        coords_3d = pixel_to_camera_coords(x_center, y_center, depth_mm,
+                                           img_w, img_h, intrinsics)
+
+        spatial_dets.append(SpatialDetection(det, coords_3d))
+
+    return spatial_dets
+
 
 # ---------------- Helpers ----------------
 def project_point_to_pixels(x_m, y_m, z_m, img_w, img_h, hfov_deg, vfov_deg=None):
@@ -395,17 +559,9 @@ class SpatialVisualizer:
         # Robot-frame ground coords (for the scatter)
         ys_left, xs_fwd = [], []
 
-        # --- identify cone class ids once ---
-        if not hasattr(self, "_cone_ids"):
-            names = [str(n).strip().lower() for n in (self.labelMap or [])]
-            aliases = {"safety cone", "traffic cone", "cone"}
-            self._cone_ids = {i for i, n in enumerate(names) if n in aliases}
-            if not self._cone_ids:
-                # Fallback to your printed map index if labelMap is missing/empty
-                self._cone_ids = {6}   # 'Safety Cone' in your map
-
-        # Track the closest cone to emit (only one message per frame)
-        closest_cone = None
+        # Track the closest detection to emit (only one message per frame)
+        # NOW: Emit for ALL detections (collars are class 0 / "object0")
+        closest_detection = None
         closest_distance = float('inf')
 
         for det in detections:
@@ -425,14 +581,13 @@ class SpatialVisualizer:
             v_r = np.array(robot_from_object.a_from_b.translation, dtype=float)
             x_fwd, y_left = v_r[0], v_r[1]
 
-            # ---- track closest cone for emission ----
-            if int(det.label) in self._cone_ids:
-                distance = math.hypot(x_fwd, y_left)
-                if distance < closest_distance:
-                    closest_distance = distance
-                    closest_cone = (x_fwd, y_left, det.confidence, det.label)
+            # Track closest detection for emission (all detections, not just specific class)
+            distance = math.hypot(x_fwd, y_left)
+            if distance < closest_distance:
+                closest_distance = distance
+                closest_detection = (x_fwd, y_left, det.confidence, det.label)
 
-            # Keep plotting ALL detections (not just cones)
+            # Keep plotting ALL detections
             if math.isfinite(x_fwd) and math.isfinite(y_left):
                 y_plot = -y_left   # flip left/right for the scatter view
                 ys_left.append(y_plot)
@@ -441,9 +596,9 @@ class SpatialVisualizer:
                     self.hist_x.append(y_plot)
                     self.hist_z.append(x_fwd)
 
-        # Emit only the closest cone (if any cone was detected this frame)
-        if closest_cone is not None:
-            x_fwd, y_left, conf, label = closest_cone
+        # Emit only the closest detection (if any detection was found this frame)
+        if closest_detection is not None:
+            x_fwd, y_left, conf, label = closest_detection
             maybe_emit_cone_goal(x_fwd, y_left, conf, label, self.labelMap)
 
         now = time.time()
@@ -509,46 +664,83 @@ class Transforms:
         return self.robot_from_camera * camera_from_object
 
 
-# ---------------- Build pipeline (v3 style) ----------------
-if TARGET_DEVICE:
-    device = dai.Device(TARGET_DEVICE)  # Lock to this OAK
-    pipeline = dai.Pipeline(device)
-else:
-    pipeline = dai.Pipeline()
+# ---------------- Build pipeline (host-side detection) ----------------
+def create_pipeline():
+    """Create OAK-D pipeline that streams RGB + Depth to host."""
+    if TARGET_DEVICE:
+        device = dai.Device(TARGET_DEVICE)
+        pipeline = dai.Pipeline(device)
+    else:
+        pipeline = dai.Pipeline()
+        device = None
 
-# Nodes
-camRgb  = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
-monoL   = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
-monoR   = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
-stereo  = pipeline.create(dai.node.StereoDepth)
-sdn     = pipeline.create(dai.node.SpatialDetectionNetwork).build(camRgb, stereo, modelDescription, fps=FPS)
+    # Camera nodes
+    camRgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+    monoL = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+    monoR = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
 
-# Stereo & NN config
-stereo.setExtendedDisparity(True)
-if pipeline.getDefaultDevice().getPlatform() == dai.Platform.RVC2:
-    stereo.setOutputSize(640, 400)
+    # Stereo depth
+    stereo = pipeline.create(dai.node.StereoDepth)
+    stereo.setExtendedDisparity(True)
+    stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)  # Align to RGB
+    if pipeline.getDefaultDevice().getPlatform() == dai.Platform.RVC2:
+        stereo.setOutputSize(640, 400)
 
-sdn.input.setBlocking(False)
-sdn.setBoundingBoxScaleFactor(0.5)
-sdn.setDepthLowerThreshold(100)
-sdn.setDepthUpperThreshold(5000)
-# sdn.setNumInferenceThreads(2)
-# sdn.setNumNCEPerInferenceThread(1)
+    monoL.requestOutput((640, 400)).link(stereo.left)
+    monoR.requestOutput((640, 400)).link(stereo.right)
 
-# Links (request mono outputs, feed StereoDepth)
-monoL.requestOutput((640, 400)).link(stereo.left)
-monoR.requestOutput((640, 400)).link(stereo.right)
+    # RGB output (full res for YOLO)
+    xoutRgb = camRgb.requestOutput((IMG_SIZE, IMG_SIZE))
 
-# Host queues (v3): create directly from node outputs (latest-only drained)
-qDepth = stereo.depth.createOutputQueue()
-qDet   = sdn.out.createOutputQueue()
-qRgb   = sdn.passthrough.createOutputQueue()
-for q in (qDepth, qDet, qRgb):
-    q.setBlocking(False); q.setMaxSize(1)
+    # Depth output
+    xoutDepth = stereo.depth
+
+    # Create output queues
+    qRgb = xoutRgb.createOutputQueue(maxSize=1, blocking=False)
+    qDepth = xoutDepth.createOutputQueue(maxSize=1, blocking=False)
+
+    return pipeline, qRgb, qDepth, device
+
+
+# Load YOLO model
+print("\n" + "="*70)
+print("HOST-SIDE YOLOE DETECTION WITH SPATIAL COORDINATES")
+print("="*70)
+print(f"Model:  {MODEL_PATH}")
+print(f"Conf:   {CONF_THRESHOLD}")
+print("="*70 + "\n")
+
+if not MODEL_PATH.exists():
+    print(f"❌ Model not found: {MODEL_PATH}")
+    sys.exit(1)
+
+detector = HostYOLODetector(MODEL_PATH, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD)
+print(f"✓ Loaded YOLO model with {len(detector.class_names)} classes")
+
+# Create pipeline
+pipeline, qRgb, qDepth, device = create_pipeline()
+
+# Get camera intrinsics
+if device is None:
+    device = pipeline.getDefaultDevice()
+
+calibData = device.readCalibration()
+intrinsics_matrix = calibData.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, IMG_SIZE, IMG_SIZE)
+
+intrinsics = {
+    'fx': intrinsics_matrix[0][0],
+    'fy': intrinsics_matrix[1][1],
+    'cx': intrinsics_matrix[0][2],
+    'cy': intrinsics_matrix[1][2],
+}
+
+print(f"\n📷 Camera Intrinsics (from calibration):")
+print(f"   fx: {intrinsics['fx']:.2f}, fy: {intrinsics['fy']:.2f}")
+print(f"   cx: {intrinsics['cx']:.2f}, cy: {intrinsics['cy']:.2f}")
 
 # Visualizer
 vis = SpatialVisualizer(N_UP_CAM)
-vis.labelMap = sdn.getClasses()
+vis.labelMap = list(detector.class_names.values())
 
 # Transforms
 xfm = Transforms(Path(os.environ.get("CAMERA_OFFSET_CONFIG", "camera_offset_config.json")))
@@ -560,11 +752,13 @@ def drain_latest(q):
         last = q.get()
     return last
 
+print("\n🚀 Starting detection loop...")
+print("   Close matplotlib window to exit\n")
+
 pipeline.start()
 with pipeline:
     latestDepth = None
     latestRgb   = None
-    latestDets  = []
 
     hfov_deg = RGB_HFOV_DEG if USE_RGB_FOV else STEREO_HFOV_DEG
     img_w = img_h = None
@@ -579,10 +773,6 @@ with pipeline:
             if depthMsg is not None:
                 latestDepth = depthMsg.getFrame()
 
-            detMsg = drain_latest(qDet)
-            if detMsg is not None:
-                latestDets = detMsg.detections
-
             rgbMsg = drain_latest(qRgb)
             if rgbMsg is not None:
                 latestRgb = rgbMsg.getCvFrame()
@@ -595,39 +785,57 @@ with pipeline:
                 if elapsed > 0:
                     vis._current_fps = frame_count / elapsed
 
-            if latestRgb is not None and latestDepth is not None:
-                depthColor = vis.processDepthFrame(latestDepth.copy())
-                h, w, _ = latestRgb.shape
+            if latestRgb is None or latestDepth is None:
+                continue
 
-                # Draw detections
-                for det in latestDets:
-                    try:
-                        vis.drawBBoxOnDepth(depthColor, det)
-                    except Exception:
-                        pass
-                    vis.drawDetOnRgb(latestRgb, det, w, h)
+            # Run YOLO detection on host
+            detections = detector.detect(latestRgb)
 
-                # Waypoint + (optional) FOV/ground-aware arcs on the NN view
-                if img_w is not None:
-                    uv = project_point_to_pixels(
-                        WAYPOINT_X_M, WAYPOINT_Y_M, WAYPOINT_Z_M,
-                        img_w, img_h, hfov_deg, vfov_deg=RGB_VFOV_DEG
-                    )
-                    # Optional overlays:
-                    # if uv is not None:
-                    #     draw_waypoint_icon(latestRgb, *uv, color=(0, 255, 255))
-                    # draw_wedge_arcs_on_image(latestRgb, ARCS_METERS, hfov_deg,
-                    #                          vfov_deg=RGB_VFOV_DEG, color=(200,200,200))
-                    # draw_ground_arcs_on_image(latestRgb, ARCS_METERS, N_UP_CAM,
-                    #                           hfov_deg, vfov_deg=RGB_VFOV_DEG, color=(200,200,200))
+            # Add spatial coordinates from depth using actual calibration
+            h, w = latestRgb.shape[:2]
+            spatial_detections = add_spatial_to_detections(
+                detections, latestDepth, w, h, intrinsics
+            )
 
-                # Update matplotlib figure with both views
-                try:
-                    vis.update_image(latestRgb)  # Add camera view
-                    vis.update_plot(latestDets)   # Update scatter plot
-                except Exception:
-                    # Matplotlib window was closed, exit gracefully
-                    break
+            # Draw detections on frame
+            display_frame = latestRgb.copy()
+            for det in spatial_detections:
+                x1 = int(det.xmin * w)
+                y1 = int(det.ymin * h)
+                x2 = int(det.xmax * w)
+                y2 = int(det.ymax * h)
+
+                # Draw box
+                cv2.rectangle(display_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+                # Label with spatial info
+                p_cam = np.array([
+                    det.spatialCoordinates.x,
+                    det.spatialCoordinates.y,
+                    det.spatialCoordinates.z
+                ]) / 1000.0  # back to meters
+
+                robot_pose = xfm.robot_pose_from_cam_point(p_cam)
+                v_r = np.array(robot_pose.a_from_b.translation)
+                dist = float(np.linalg.norm(v_r))
+
+                label = f"{det.label_name} {det.confidence:.2f} {dist:.2f}m"
+                cv2.putText(display_frame, label, (x1, y1-10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+            # Update matplotlib figure with both views
+            try:
+                vis.update_image(display_frame)  # Add camera view
+                vis.update_plot(spatial_detections)   # Update scatter plot
+            except Exception:
+                # Matplotlib window was closed, exit gracefully
+                break
+
+            # FPS counter
+            if frame_count % 30 == 0:
+                fps = 30 / (time.time() - fps_start_time)
+                print(f"FPS: {fps:.1f}  |  Detections: {len(spatial_detections)}")
+                fps_start_time = time.time()
 
             # Check for quit key or if matplotlib window is closed
             if cv2.waitKey(1) == ord('q'):

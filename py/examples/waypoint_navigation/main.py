@@ -162,12 +162,14 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             # ---- parse ----
             try:
                 msg = json.loads(data.decode())
-                if msg.get("class_id") != int(6):
+                # Accept class_id 0 (collars from visual prompting)
+                # Previously filtered for class_id 6 (Safety Cone)
+                if msg.get("class_id") != int(0):
                     continue
                 name = str(msg["class_name"])
                 x = float(msg["x_fwd_m"])
                 y = float(msg["y_left_m"])
-                
+
                 conf = float(msg.get("confidence", 1.0))
             except Exception as e:
                 print(f"[VISION] bad msg: {e}")
