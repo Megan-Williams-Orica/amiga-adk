@@ -59,6 +59,7 @@ class NavigationManager:
         self.actuator = actuator or NullActuator()
         self.actuator_deploying = False
         self.track_executing = False  # Track if robot is actively executing a track segment
+        self.waiting_for_collar_detection = False  # Track if robot is stopped at approach position waiting for vision
         self._controller_lock = getattr(self, "_controller_lock", asyncio.Lock())
 
 
@@ -465,6 +466,9 @@ class NavigationManager:
                             enter_prompt="Hole measured. Press ENTER to close the chute...",
                             enter_timeout=30.0,      # safety timeout
                         )
+
+                        # Wait for CAN bus to settle after actuator deployment
+                        await asyncio.sleep(1.0)
                     finally:
                         # Clear flag when deployment is complete
                         self.actuator_deploying = False
@@ -528,13 +532,69 @@ class NavigationManager:
 
                 # Determine if this is a waypoint segment (should deploy) vs turn/maneuver segment (no deployment)
                 is_waypoint_segment = "waypoint" in segment_name.lower() and "row_end" not in segment_name.lower()
+                is_approach_segment = "approach" in segment_name.lower()
 
-                # Check if this is a waypoint segment (not turn/approach) and wait for vision if enabled
-                if is_waypoint_segment:
+                # Save track to navigation progress
+                self.navigation_progress[segment_name] = track_segment
+
+                # Execute approach segment (stops 2m before search zone)
+                if is_approach_segment:
+                    logger.info("[APPROACH] Executing approach segment (stopping 2m before search zone)")
+                    success = await self.execute_single_track(track_segment, do_post_actions=False)
+
+                    if not success:
+                        logger.warning("Approach segment failed, retrying...")
+                        # Decrement waypoint index so redo_last_segment() retries the same waypoint
+                        self.motion_planner.current_waypoint_index -= 1
+                        continue
+
+                    logger.info("[APPROACH] Reached approach waypoint, waiting for collar detection...")
+
+                    # Set flag to allow vision to override waypoint position
+                    self.waiting_for_collar_detection = True
+
+                    # Wait for vision to detect collar at approach position
+                    should_proceed = await self._wait_for_cone_or_skip()
+
+                    # Clear flag after vision detection or skip
+                    self.waiting_for_collar_detection = False
+
+                    if not should_proceed:
+                        # Shutdown was requested during wait
+                        break
+
+                    # Rebuild track from approach position to actual collar location
+                    if getattr(self, "cone_detected_for_current_wp", False):
+                        logger.info("[VISION] Collar detected, creating final approach track to collar")
+                        final_approach_track = await self.motion_planner.create_approach_to_waypoint_segment()
+                    else:
+                        logger.info("[VISION] No collar detected, proceeding to CSV waypoint")
+                        final_approach_track = await self.motion_planner.create_approach_to_waypoint_segment()
+
+                    # Reset flag for next waypoint
+                    self.cone_detected_for_current_wp = False
+
+                    # Execute final approach with deployment
+                    final_segment_name = f"final_approach_{segment_name}"
+                    self.navigation_progress[final_segment_name] = final_approach_track
+                    logger.info("[APPROACH] Executing final approach to collar/waypoint")
+                    success = await self.execute_single_track(final_approach_track, do_post_actions=True)
+
+                elif is_waypoint_segment:
+                    # Old behavior: direct waypoint approach (shouldn't happen with new approach system)
+                    # This path is used when robot starts close to waypoint (skips approach segment)
+                    # Check if this is a waypoint segment (not turn/approach) and wait for vision if enabled
                     # Use _wait_for_cone_or_skip which checks if vision is enabled
                     # If vision is enabled: waits indefinitely for cone
                     # If vision is disabled: proceeds immediately to CSV waypoint
+
+                    # Set flag to allow vision to override waypoint position
+                    self.waiting_for_collar_detection = True
+
                     should_proceed = await self._wait_for_cone_or_skip()
+
+                    # Clear flag after vision detection or skip
+                    self.waiting_for_collar_detection = False
 
                     if not should_proceed:
                         # Shutdown was requested during wait
@@ -550,11 +610,11 @@ class NavigationManager:
                     # Reset flag for next waypoint
                     self.cone_detected_for_current_wp = False
 
-                # Save track to navigation progress
-                self.navigation_progress[segment_name] = track_segment
-
-                # Execute the track segment with deployment only for waypoint segments
-                success = await self.execute_single_track(track_segment, do_post_actions=is_waypoint_segment)
+                    # Execute the track segment with deployment
+                    success = await self.execute_single_track(track_segment, do_post_actions=True)
+                else:
+                    # Turn/maneuver segments - no deployment
+                    success = await self.execute_single_track(track_segment, do_post_actions=False)
 
                 failed_attempts: int = 0
 
@@ -570,7 +630,11 @@ class NavigationManager:
                             f"Moving robot forward | Failed attempts: {failed_attempts}")
                         failed_attempts = 0
                     track_segment, segment_name = await self.motion_planner.redo_last_segment()
-                    success = await self.execute_single_track(track_segment)
+                    # Preserve segment type: no deployment for row-end or approach segments
+                    is_waypoint_segment = "waypoint" in segment_name.lower() and "row_end" not in segment_name.lower()
+                    is_approach_segment = "approach" in segment_name.lower()
+                    should_deploy = is_waypoint_segment and not is_approach_segment
+                    success = await self.execute_single_track(track_segment, do_post_actions=should_deploy)
 
             logger.info(
                 f"Navigation completed after {segment_count} segments")

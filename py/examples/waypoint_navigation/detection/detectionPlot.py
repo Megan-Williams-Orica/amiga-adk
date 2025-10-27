@@ -17,7 +17,7 @@ from farm_ng_core_pybind import Rotation3F64
 
 # YOLO model
 try:
-    from ultralytics import YOLO
+    from ultralytics import YOLOE
     ULTRALYTICS_AVAILABLE = True
 except ImportError:
     print("⚠️  Ultralytics not installed. Install with: pip install ultralytics")
@@ -28,6 +28,9 @@ from utils.pose_cache import get_latest_pose, set_latest_pose
 
 
 # ---------------- Model / rates ----------------
+# MODEL_PATH = Path(__file__).parent / "collarDetectionV2.engine"
+# MODEL_PATH = Path(__file__).parent / "White_Barrel.onnx"
+# MODEL_PATH = Path(__file__).parent / "yoloe-11s-seg-pf.pt"
 MODEL_PATH = Path(__file__).parent / "yoloe-11s-seg.engine"
 CONF_THRESHOLD = 0.3
 IOU_THRESHOLD = 0.5
@@ -138,7 +141,7 @@ class HostYOLODetector:
         if not ULTRALYTICS_AVAILABLE:
             raise ImportError("Ultralytics required. Install: pip install ultralytics")
 
-        self.model = YOLO(str(model_path))
+        self.model = YOLOE(str(model_path))
         self.conf = conf
         self.iou = iou
         self.class_names = self.model.names
@@ -158,8 +161,9 @@ class HostYOLODetector:
                 cls_id = int(box.cls[0])
 
                 # Only keep class 0 detections (from visual prompting)
-                if cls_id != 0:
-                    continue
+                # FILTER DISABLED - accepting all classes
+                # if cls_id != 0:
+                #     continue
 
                 # Handle class name safely
                 if cls_id in self.class_names:
@@ -203,9 +207,25 @@ class SpatialDetection:
 
 
 def add_spatial_to_detections(detections: List[dict], depth_frame: np.ndarray,
-                               img_w: int, img_h: int, intrinsics: dict) -> List[SpatialDetection]:
+                               img_w: int, img_h: int, intrinsics: dict,
+                               use_geometric_correction: bool = False) -> List[SpatialDetection]:
     """Add 3D spatial coordinates to detections using depth map."""
     spatial_dets = []
+    closest_det_info = None  # Track closest detection for logging
+
+    # Import geometric correction if needed
+    if use_geometric_correction:
+        try:
+            from geometric_depth_correction import pixel_to_camera_coords_corrected
+            geometric_available = True
+            print("[GEOM] ✓ Geometric depth correction enabled (110mm x 118mm collar, 50% blend)")
+        except ImportError as e:
+            print(f"⚠️  geometric_depth_correction not available: {e}")
+            print("⚠️  Using sensor depth only")
+            geometric_available = False
+    else:
+        geometric_available = False
+        print("[GEOM] Geometric correction disabled by parameter")
 
     for det in detections:
         # Use center of bounding box
@@ -218,11 +238,40 @@ def add_spatial_to_detections(detections: List[dict], depth_frame: np.ndarray,
         if depth_mm is None or depth_mm < DEPTH_LOWER_MM or depth_mm > DEPTH_UPPER_MM:
             continue  # Skip detections with invalid depth
 
-        # Convert to 3D camera coordinates using actual calibration
-        coords_3d = pixel_to_camera_coords(x_center, y_center, depth_mm,
-                                           img_w, img_h, intrinsics)
+        # Apply geometric depth correction using known collar dimensions
+        if geometric_available:
+            coords_3d, diagnostics = pixel_to_camera_coords_corrected(
+                det['xmin'], det['ymin'], det['xmax'], det['ymax'],
+                depth_mm, img_w, img_h, intrinsics,
+                apply_correction=True,
+                blend_weight=0.5  # 50/50 blend between geometric and sensor
+            )
+            # Track closest detection for logging
+            if diagnostics.get('correction_applied'):
+                distance = coords_3d[2]  # z-coordinate is forward distance
+                if closest_det_info is None or distance < closest_det_info['distance']:
+                    closest_det_info = {
+                        'distance': distance,
+                        'diagnostics': diagnostics
+                    }
+        else:
+            # Fallback to standard depth
+            coords_3d = pixel_to_camera_coords(x_center, y_center, depth_mm,
+                                               img_w, img_h, intrinsics)
 
         spatial_dets.append(SpatialDetection(det, coords_3d))
+
+    # Log correction for closest detection only
+    if closest_det_info is not None:
+        diagnostics = closest_det_info['diagnostics']
+        correction_cm = diagnostics.get('correction_cm', 0)
+        if abs(correction_cm) > 5:  # Log if correction > 5cm
+            bbox_w_px = diagnostics.get('bbox_width_px', 0)
+            bbox_h_px = diagnostics.get('bbox_height_px', 0)
+            print(f"[GEOM] Depth corrected by {correction_cm:+.1f}cm "
+                  f"(sensor: {diagnostics['depth_sensor_m']:.2f}m → "
+                  f"corrected: {diagnostics['depth_corrected_m']:.2f}m) "
+                  f"bbox: {bbox_w_px:.0f}x{bbox_h_px:.0f}px")
 
     return spatial_dets
 

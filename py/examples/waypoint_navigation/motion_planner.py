@@ -195,6 +195,7 @@ class MotionPlanner:
             offset_data = json.load(f)
 
         translation = offset_data["translation"]
+        logger.info(f"Loaded tool offset from {tool_offsets_path}: x={translation['x']:.3f}m, y={translation['y']:.3f}m, z={translation['z']:.3f}m")
 
         # Define tool_from_robot instead of robot_from_tool
         robot_from_tool = Pose3F64(
@@ -263,11 +264,13 @@ class MotionPlanner:
         return current_pose
 
     async def create_tool_to_origin_segment(self) -> Track:
-        """Micro-move: plumbob→chute/origin. Here we only need +0.30 m forward."""
-        advance_m = 0.30  # your measured value
+        """Micro-move: tool→robot_origin. Advances by the tool offset distance from config."""
+        # Use the actual tool offset from config file
+        advance_m = float(self.tool_offset.a_from_b.translation[0])
         current = await self._get_current_pose()
         track_builder = TrackBuilder(start=current)
         track_builder.create_straight_segment(next_frame_b="tool_to_origin", distance=advance_m, spacing=0.05)
+        logger.info(f"Creating tool-to-origin segment: advancing {advance_m:.3f}m (from tool_config.json)")
         return track_builder.track
 
     async def override_next_waypoint_world_xy(self, X_w: float, Y_w: float, yaw_rad: float | None = None) -> int:
@@ -277,6 +280,9 @@ class MotionPlanner:
 
         Since _create_ab_segment_to_next_waypoint() increments current_waypoint_index BEFORE building the track,
         current_waypoint_index already points to the waypoint we're currently navigating toward.
+
+        NOTE: (X_w, Y_w) represents the HOLE/COLLAR position. This method applies the tool offset
+        transformation to calculate where the robot center should be, just like CSV waypoint loading does.
         """
         # Determine which waypoint to replace (the current target)
         idx = max(1, self.current_waypoint_index)
@@ -286,9 +292,19 @@ class MotionPlanner:
             pose_now = await self._get_current_pose()
             yaw_rad = float(pose_now.a_from_b.rotation.log()[-1])
 
-        # Build a world_from_robot pose for the waypoint (your waypoints dict stores robot poses)
-        iso = Isometry3F64([float(X_w), float(Y_w), 0.0], Rotation3F64.Rz(float(yaw_rad)))
-        world_from_robot = Pose3F64(iso, frame_a="world", frame_b="robot")
+        # Build world_from_hole pose (vision detects collar/hole position)
+        iso_hole = Isometry3F64([float(X_w), float(Y_w), 0.0], Rotation3F64.Rz(float(yaw_rad)))
+        world_from_hole = Pose3F64(iso_hole, frame_a="world", frame_b="hole")
+
+        # Transform hole position to robot position using tool offset
+        # world_from_robot = world_from_hole * hole_from_robot
+        hole_from_robot = self.tool_offset.inverse()
+        hole_from_robot.frame_a = "hole"
+        hole_from_robot.frame_b = "robot"
+
+        world_from_robot = world_from_hole * hole_from_robot
+
+        logger.info(f"[VISION] Override waypoint {idx}: hole @ ({X_w:.3f}, {Y_w:.3f}) → robot @ ({world_from_robot.a_from_b.translation[0]:.3f}, {world_from_robot.a_from_b.translation[1]:.3f}) with tool offset {self.tool_offset.a_from_b.translation[0]:.3f}m")
 
         self.waypoints[idx] = world_from_robot
         return idx
@@ -481,8 +497,11 @@ class MotionPlanner:
 
         return track_builder.track
 
-    async def _create_ab_segment_to_next_waypoint(self) -> Track:
-        """Create an AB segment to the next waypoint.
+    async def _create_ab_segment_to_next_waypoint(self, approach_offset_m: float = 0.0) -> Track:
+        """Create an AB segment to the next waypoint, optionally with approach offset.
+
+        Args:
+            approach_offset_m: Distance to stop before the waypoint (0.0 = go to waypoint directly)
 
         Returns:
             The track segment to the next waypoint (Track)
@@ -493,9 +512,65 @@ class MotionPlanner:
         # 2. Create the track (AB) segment to the next waypoint
         track_builder = TrackBuilder(start=current_pose)
         self.current_waypoint_index += 1
+
+        target_pose = self.waypoints[self.current_waypoint_index]
+
+        # If approach_offset_m is specified, create intermediate approach waypoint
+        if approach_offset_m > 0.0:
+            # Calculate position 2m before the target waypoint
+            current_x = current_pose.a_from_b.translation[0]
+            current_y = current_pose.a_from_b.translation[1]
+            target_x = target_pose.a_from_b.translation[0]
+            target_y = target_pose.a_from_b.translation[1]
+
+            approach_x, approach_y = _offset_towards(
+                (current_x, current_y),
+                (target_x, target_y),
+                approach_offset_m
+            )
+
+            # Create approach pose with current heading (don't force rotation)
+            # This prevents premature turns when waypoints have opposite directions
+            current_heading = current_pose.a_from_b.rotation
+            approach_iso = Isometry3F64(
+                np.array([approach_x, approach_y, 0.0], dtype=np.float64),
+                current_heading
+            )
+            approach_pose = Pose3F64(
+                a_from_b=approach_iso,
+                frame_a="world",
+                frame_b=f"approach_{self.current_waypoint_index}"
+            )
+
+            # Build track to approach waypoint (not full waypoint yet)
+            track_builder.create_ab_segment(
+                next_frame_b=f"approach_{self.current_waypoint_index}",
+                final_pose=approach_pose,
+                spacing=0.1,
+            )
+        else:
+            # Standard behavior - go directly to waypoint
+            track_builder.create_ab_segment(
+                next_frame_b=f"waypoint_{self.current_waypoint_index}",
+                final_pose=target_pose,
+                spacing=0.1,
+            )
+
+        return track_builder.track
+
+    async def create_approach_to_waypoint_segment(self) -> Track:
+        """Create segment from current approach position to the actual waypoint.
+
+        This is called after stopping at the approach waypoint and detecting the collar.
+        Returns a track from current position to the waypoint (which may have been overridden by vision).
+        """
+        current_pose = await self._get_current_pose()
+        target_pose = self.waypoints[self.current_waypoint_index]
+
+        track_builder = TrackBuilder(start=current_pose)
         track_builder.create_ab_segment(
             next_frame_b=f"waypoint_{self.current_waypoint_index}",
-            final_pose=self.waypoints[self.current_waypoint_index],
+            final_pose=target_pose,
             spacing=0.1,
         )
         return track_builder.track
@@ -603,9 +678,36 @@ class MotionPlanner:
         if self.current_waypoint_index != self.last_row_waypoint_index:
             # We're not transitioning to a new row, we will just create an AB segment to the next waypoint
             curr_index = self.current_waypoint_index
-            track = await self._create_ab_segment_to_next_waypoint()
-            next_index = self.current_waypoint_index
-            seg_name = f"waypoint_{curr_index}_to_{next_index}"
+
+            # Check if robot is already close to the next waypoint
+            current_pose = await self._get_current_pose()
+            next_waypoint_idx = self.current_waypoint_index + 1
+            if next_waypoint_idx in self.waypoints:
+                target_pose = self.waypoints[next_waypoint_idx]
+                current_x = current_pose.a_from_b.translation[0]
+                current_y = current_pose.a_from_b.translation[1]
+                target_x = target_pose.a_from_b.translation[0]
+                target_y = target_pose.a_from_b.translation[1]
+                distance_to_waypoint = hypot(target_x - current_x, target_y - current_y)
+
+                # Only use two-stage approach if robot is far enough away
+                APPROACH_OFFSET = 2.0
+                if distance_to_waypoint > APPROACH_OFFSET + 0.5:  # Add 0.5m buffer
+                    # Robot is far - use two-stage approach
+                    track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=APPROACH_OFFSET)
+                    next_index = self.current_waypoint_index
+                    seg_name = f"approach_waypoint_{curr_index}_to_{next_index}"
+                else:
+                    # Robot is already close - direct approach
+                    track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=0.0)
+                    next_index = self.current_waypoint_index
+                    seg_name = f"waypoint_{curr_index}_to_{next_index}"
+            else:
+                # Fallback: use direct approach
+                track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=0.0)
+                next_index = self.current_waypoint_index
+                seg_name = f"waypoint_{curr_index}_to_{next_index}"
+
             return (track, seg_name)
 
         # We're switching to the next row
@@ -613,11 +715,37 @@ class MotionPlanner:
         if self.row_end_segment_index >= 5:
             logger.info(
                 "Finished all row end maneuvers, moving to the next row.")
-            # Use segment name without "row_end" to ensure deployment happens at first waypoint of next row
             curr_index = self.current_waypoint_index
-            track = await self._create_ab_segment_to_next_waypoint()
-            next_index = self.current_waypoint_index
-            seg_name = f"waypoint_{curr_index}_to_{next_index}"
+
+            # Check if robot is already close to the first waypoint of next row
+            current_pose = await self._get_current_pose()
+            next_waypoint_idx = self.current_waypoint_index + 1
+            if next_waypoint_idx in self.waypoints:
+                target_pose = self.waypoints[next_waypoint_idx]
+                current_x = current_pose.a_from_b.translation[0]
+                current_y = current_pose.a_from_b.translation[1]
+                target_x = target_pose.a_from_b.translation[0]
+                target_y = target_pose.a_from_b.translation[1]
+                distance_to_waypoint = hypot(target_x - current_x, target_y - current_y)
+
+                # Only use two-stage approach if robot is far enough away
+                APPROACH_OFFSET = 2.0
+                if distance_to_waypoint > APPROACH_OFFSET + 0.5:  # Add 0.5m buffer
+                    # Robot is far - use two-stage approach
+                    track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=APPROACH_OFFSET)
+                    next_index = self.current_waypoint_index
+                    seg_name = f"approach_waypoint_{curr_index}_to_{next_index}"
+                else:
+                    # Robot is already close - direct approach
+                    track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=0.0)
+                    next_index = self.current_waypoint_index
+                    seg_name = f"waypoint_{curr_index}_to_{next_index}"
+            else:
+                # Fallback: use direct approach
+                track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=0.0)
+                next_index = self.current_waypoint_index
+                seg_name = f"waypoint_{curr_index}_to_{next_index}"
+
             return (track, seg_name)
         else:
             # We need to return a segment from the row end maneuver

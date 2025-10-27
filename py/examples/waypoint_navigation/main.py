@@ -278,10 +278,11 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                     print(f"[VISION] skip: debounce (moved={moved:.2f}, dt={now-last_sent_t:.2f})")
                     continue
 
-            # ---- Check if track is currently executing ----
-            # Only allow waypoint overrides when robot is between segments
-            if getattr(nav_manager, "track_executing", False):
-                print("[VISION] skip: track currently executing, waiting for segment completion")
+            # ---- Check if robot is waiting at approach position for collar detection ----
+            # Only allow waypoint overrides when robot has stopped at approach waypoint (2m before collar)
+            # This prevents overrides during row-end turns or other maneuvers when heading is incorrect
+            if not getattr(nav_manager, "waiting_for_collar_detection", False):
+                print("[VISION] skip: not at approach position yet, waiting for robot to stop before collar")
                 continue
 
             # --- Override waypoint position with cone location ---
