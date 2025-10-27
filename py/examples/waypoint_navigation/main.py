@@ -460,18 +460,6 @@ if __name__ == "__main__":
     parser.add_argument("--actuator-id", type=int, default=0,
                         help="H-bridge actuator ID (default: 0)")
     parser.add_argument(
-        "--actuator-open-seconds",
-        type=float,
-        default=6,
-        help="Duration to drive actuator in OPEN after reaching a waypoint (seconds).",
-    )
-    parser.add_argument(
-        "--actuator-close-seconds",
-        type=float,
-        default=6,
-        help="Duration to drive actuator in CLOSE after reaching a waypoint (seconds).",
-    )
-    parser.add_argument(
         "--actuator-rate-hz",
         type=float,
         default=10.0,

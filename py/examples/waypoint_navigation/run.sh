@@ -16,6 +16,6 @@ python main.py \
  --turn-direction left \
  --row-spacing 2.8 \
  --headland-buffer 2.0 \
- --actuator-enabled --actuator-id 0 --actuator-open-seconds 6 --actuator-close-seconds 7 --actuator-rate-hz 5.0 2>&1 | tee "$LOG_FILE"
+ --actuator-enabled --actuator-id 0 --actuator-rate-hz 5.0 2>&1 | tee "$LOG_FILE"
 
 echo "Log saved to: $LOG_FILE"
