@@ -141,7 +141,52 @@ dmypy.json
 # Ignore generated visualization outputs
 py/examples/waypoint_navigation/visualization/navigation_progress.json
 py/examples/waypoint_navigation/visualization/robot_positions.json
+py/examples/waypoint_navigation/visualization/cone_detections.json
+py/examples/waypoint_navigation/visualization/navigation_plots/*.png
 
 # Ignore generated csv and json tracks
 py/examples/waypoint_navigation/surveyed-waypoints/*.csv
 py/examples/waypoint_navigation/surveyed-waypoints/*.json
+
+# Ignore test/experimental files
+py/examples/waypoint_navigation/WpRadiusTest.py
+py/examples/waypoint_navigation/export_classic_yolov5.py
+py/examples/vehicle_twist/canbusTwist.py
+py/examples/vehicle_twist/code.py
+
+# Ignore YOLO model files and detection utilities
+py/examples/waypoint_navigation/detection/convert_to_blob.py
+py/examples/waypoint_navigation/detection/detectionPlotNewModel.py
+py/examples/waypoint_navigation/detection/modelConverter.py
+py/examples/waypoint_navigation/detection/yolov8_custom_spatial.py
+py/examples/waypoint_navigation/detection/shared_with_container/
+py/examples/waypoint_navigation/detection/yolov5/
+py/examples/waypoint_navigation/detection/export_to_blob.py
+py/examples/waypoint_navigation/detection/geometric_depth_correction.py
+py/examples/waypoint_navigation/detection/test_correction.py
+py/examples/waypoint_navigation/detection/testScripts/
+py/examples/waypoint_navigation/detection/README.roboflow.txt
+py/examples/waypoint_navigation/detection/data.yaml
+py/examples/waypoint_navigation/detection/requirements_training.txt
+py/examples/waypoint_navigation/detection/mobileclip_blt.ts
+*.pt
+*.onnx
+*.engine
+
+# Ignore test data and processed outputs
+py/tests/gps_waypoint/physicsLabBackConv.csv
+py/tests/gps_waypoint/powerLinesProcessed.csv
+py/tests/gps_waypoint/powerLinesSurveyed.csv
+py/tests/gps_waypoint/latLonToUTM.py
+py/tests/camera_overlay/main.py
+py/tests/camera_model_yoloE/
+py/tests/canbusMessaging/
+
+# Ignore xdipper folder (separate project)
+xdipper/
+
+# Ignore CLAUDE.md (AI assistant instructions)
+CLAUDE.md
+
+# Cached vision models
+*.depthai_cached_models/

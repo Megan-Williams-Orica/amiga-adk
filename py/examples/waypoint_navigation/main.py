@@ -85,70 +85,53 @@ def _update_pose_from_filter(filter_msg) -> None:
 
     set_latest_pose(x_m, y_m, yaw_rad)
         
-async def vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=10.0):
-    """
-    Listens for UDP 'cone_goal' messages and overrides the follower by:
-      /cancel -> /set_track (short vision track) -> /start
-    Now also /pause if auto mode is disabled (robot not controllable).
-    """
+# Vision configuration
+VISION_SEARCH_RADIUS_M = 1.0  # Search radius around CSV waypoints for cone detection
+VISION_WAIT_TIMEOUT_S = 10.0  # How long to wait for cone detection before skipping waypoint
 
-    # --- helpers ------------------------------------------------------------
-    async def get_state() -> TrackFollowerState:
-        return await controller_client.request_reply("/get_state", Empty(), decode=True)
-
-    def _is_terminal(st: TrackFollowerState) -> bool:
-        return st.status.track_status in (
-            TrackStatusEnum.TRACK_COMPLETE,
-            TrackStatusEnum.TRACK_ABORTED,
-            TrackStatusEnum.TRACK_FAILED,
-            TrackStatusEnum.TRACK_TIMEOUT,
+def is_vision_enabled() -> bool:
+    """Check if detectionPlot.py is running to determine if vision mode is active."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "detectionPlot.py"],
+            capture_output=True,
+            text=True,
+            timeout=1.0
         )
-       
-    def controllable_from_state(st) -> bool:
-        rs = getattr(st, "robot_status", None)
-        return bool(getattr(rs, "controllable", False))
- 
-    async def wait_until(pred, timeout: float, poll_s: float = 0.05):
-        """
-        Poll follower state until pred(state) is True, or timeout elapses.
-        Assumes get_state() returns a decoded TrackFollowerState (decode=True).
-        """
-        loop = asyncio.get_event_loop()
-        deadline = loop.time() + timeout
+        return result.returncode == 0  # Returns 0 if process found
+    except Exception:
+        return False
 
-        # initial sample
-        st = await get_state()  # TrackFollowerState
-        while not pred(st):
-            if loop.time() >= deadline:
-                raise TimeoutError("wait condition not met")
+# TODO: Refactor into a separate module
+async def vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=2.0):
+    """
+    Listens for UDP 'cone_goal' messages from detectionPlot.py and overrides waypoint positions.
 
-            await asyncio.sleep(poll_s)
+    When vision is enabled (detectionPlot.py is running):
+    - CSV waypoints act as 'search zone centers' with radius VISION_SEARCH_RADIUS_M
+    - When a cone is detected within the search radius, the waypoint position is overridden
+      with the actual cone location
+    - Navigation manager handles all execution, deployment, and state management
+    - Robot drives to cones instead of CSV waypoints when vision is enabled
 
-            try:
-                st = await get_state()  # keep sampling
-                if st is None:
-                    # extremely defensive: treat as transient failure
-                    continue
-            except Exception as e:
-                # transient RPC/wire hiccup; keep trying until deadline
-                # (optionally log: print(f"[vision] get_state failed: {e}"))
-                continue
+    When vision is disabled:
+    - Robot drives directly to CSV waypoint positions (normal behavior)
+    """
 
-        return st
+    # Track when cone was last detected in search zone for current waypoint
+    if not hasattr(nav_manager, "cone_detected_for_current_wp"):
+        nav_manager.cone_detected_for_current_wp = False
+    if not hasattr(nav_manager, "current_waypoint_start_time"):
+        nav_manager.current_waypoint_start_time = None
 
+    # Track which waypoint index we last successfully triggered vision for
+    if not hasattr(nav_manager, "vision_completed_waypoints"):
+        nav_manager.vision_completed_waypoints = set()
 
-    # One mutex to rule all controller RPCs (prevents races with nav loop)
-    if not hasattr(nav_manager, "_controller_lock"):
-        nav_manager._controller_lock = asyncio.Lock()
-    ctl_lock: asyncio.Lock = nav_manager._controller_lock
-
-    # Latch state on the nav_manager object so it’s visible across loops
-    if not hasattr(nav_manager, "vision_latched"):
-        nav_manager.vision_latched = False
-    if not hasattr(nav_manager, "vision_latch_deadline"):
-        nav_manager.vision_latch_deadline = 0.0
-
-    LATCH_MAX_S = 20.0  # safety timeout for a vision retarget (tune as you like)
+    # Track all cone detections for visualization
+    if not hasattr(nav_manager, "cone_detections"):
+        nav_manager.cone_detections = []
 
     # --- socket setup -------------------------------------------------------
     loop = asyncio.get_running_loop()
@@ -167,55 +150,35 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
 
     try:
         while True:
-            # --- while latched, just watch state and drop messages ---
-            if nav_manager.vision_latched:
-                # auto-unlatch on terminal state or timeout
-                try:
-                    st = await get_state()
-                    if _is_terminal(st) or (asyncio.get_event_loop().time() >= nav_manager.vision_latch_deadline):
-                        nav_manager.vision_latched = False
-                        # small grace to avoid immediate re-trigger on the same frame
-                        await asyncio.sleep(0.2)
-                except Exception:
-                    # if state read hiccups, keep latch until deadline
-                    pass
-
-                # drain/ignore incoming UDP quickly, then continue loop
-                try:
-                    _ = await asyncio.wait_for(
-                        asyncio.get_running_loop().run_in_executor(None, sock.recvfrom, 4096), timeout=0.01
-                    )
-                except Exception:
-                    await asyncio.sleep(0.03)
-                continue
-
-            # ---- receive next message (non-latched path) ----
+            # ---- receive next message ----
             try:
                 data, _ = await loop.run_in_executor(None, sock.recvfrom, 4096)
             except socket.timeout:
                 continue
             except Exception as e:
-                print(f"[vision] recv error: {e}")
+                print(f"[VISION] recv error: {e}")
                 continue
 
             # ---- parse ----
             try:
                 msg = json.loads(data.decode())
-                if msg.get("class_id") != int(6):
+                # Accept class_id 0 (collars from visual prompting)
+                # Previously filtered for class_id 6 (Safety Cone)
+                if msg.get("class_id") != int(0):
                     continue
                 name = str(msg["class_name"])
                 x = float(msg["x_fwd_m"])
                 y = float(msg["y_left_m"])
-                
+
                 conf = float(msg.get("confidence", 1.0))
             except Exception as e:
-                print(f"[vision] bad msg: {e}")
+                print(f"[VISION] bad msg: {e}")
                 continue
 
             # ---- pose check ----
             pose = await motion_planner._get_current_pose()
             if pose is None:
-                print("[vision] skip: pose None (filter down)")
+                print("[VISION] skip: pose None (filter down)")
                 continue
             
             yaw = pose.a_from_b.rotation.log()[-1]
@@ -223,50 +186,88 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             c, s = math.cos(yaw), math.sin(yaw)
 
             # robot frame (x = forward, y = left)  -> world/map (X, Y)
+            
             X_obj = xr + x * c - y * s
             Y_obj = yr + x * s + y * c
-            print(f"[vision] obj world: X={X_obj:.2f} m, Y={Y_obj:.2f} m  | robot @ ({xr:.2f}, {yr:.2f}), ψ={yaw:.2f} rad")
+            print(f"[VISION] WP Location: Y={X_obj:.2f} m, X={-Y_obj:.2f} m  | robot @ ({xr:.2f}, {-yr:.2f}), ψ={math.degrees(yaw):.2f} deg")
                     
-            # ---- distance to next nominal waypoint (if available) ----
-            def distance_to_nominal_or_none():
-                # Primary: the current planned goal (planner keeps it at key 1)
-                next_goal = (motion_planner.waypoints.get(1)
-                            if hasattr(motion_planner.waypoints, "get")
-                            else (motion_planner.waypoints[1] if len(motion_planner.waypoints) > 1 else None))
-                # Optional fallback: try legacy indexing if your waypoints are a list/dict of future goals
-                if next_goal is None:
-                    idx = motion_planner.current_waypoint_index + 1
+            # ---- distance from detected cone to ORIGINAL CSV waypoint (search zone center) ----
+            def cone_distance_from_csv_waypoint():
+                """
+                Calculate distance from detected cone to the ORIGINAL CSV waypoint.
+                This is used to validate if the cone is within the search zone.
+                The search zone is centered at the current target waypoint.
+                """
+                # Get the original CSV waypoint for the current target waypoint
+                # Since _create_ab_segment_to_next_waypoint() increments BEFORE building,
+                # current_waypoint_index already points to the waypoint we're navigating toward
+                csv_waypoint = None
+                idx = max(1, motion_planner.current_waypoint_index)
+
+                if hasattr(motion_planner, "original_csv_waypoints"):
+                    csv_waypoint = motion_planner.original_csv_waypoints.get(idx)
+
+                # Fallback to regular waypoints if original_csv_waypoints not available
+                if csv_waypoint is None and hasattr(motion_planner, "waypoints"):
                     if hasattr(motion_planner.waypoints, "get"):
-                        next_goal = motion_planner.waypoints.get(idx)
-                    elif 0 <= idx < len(motion_planner.waypoints):
-                        next_goal = motion_planner.waypoints[idx]
+                        csv_waypoint = motion_planner.waypoints.get(idx)
+                    elif isinstance(motion_planner.waypoints, (list, tuple)) and idx < len(motion_planner.waypoints):
+                        csv_waypoint = motion_planner.waypoints[idx]
 
-                if next_goal is not None:
-                    dx, dy = (next_goal.a_from_b.translation - pose.a_from_b.translation)[:2]
-                    return math.hypot(dx, dy)
-                return None
+                # Calculate distance from detected cone to CSV waypoint
+                if csv_waypoint is not None:
+                    csv_x = float(csv_waypoint.a_from_b.translation[0])
+                    csv_y = float(csv_waypoint.a_from_b.translation[1])
+                    distance = math.hypot(X_obj - csv_x, Y_obj - csv_y)
+                    return distance, idx
+                return None, None
 
-            d_nom = distance_to_nominal_or_none()
-            if d_nom is not None:
-                print(f"[vision] proximity: {d_nom:.2f} m (threshold {proximity_m:.2f})")
+            dist_goal_wp, target_wp_idx = cone_distance_from_csv_waypoint()
 
-            # ---- cone gates (robot frame) ----
+            # ---- cone validation gates ----
             r = math.hypot(x, y)
-            print(f"[vision] cone rf: x={x:.2f} y={y:.2f} r={r:.2f} conf={conf:.2f}")
-            PROX_OK   = (d_nom is not None and d_nom <= proximity_m)  # near nominal path
-            CONE_NEAR = (0.3 <= r <= 2.0)                              # very close
-            CONE_OK   = (0.3 <= r <= 6.0 and abs(y) <= 3.0 and x >= 0.3 and conf >= 0.5)
 
-            # follower status (for FOLLOWING_OK gate)
-            try:
-                st = await get_state()
-                is_following = (st.status.track_status == TrackStatusEnum.TRACK_FOLLOWING)
-            except Exception:
-                is_following = False
-            FOLLOWING_OK = (is_following and CONE_OK)
+            # Debug output
+            if dist_goal_wp is not None:
+                # Get waypoint coordinates for display (target_wp_idx is the NEXT waypoint)
+                csv_waypoint = motion_planner.original_csv_waypoints.get(target_wp_idx)
+                if csv_waypoint is not None:
+                    wp_x = float(csv_waypoint.a_from_b.translation[0])
+                    wp_y = float(csv_waypoint.a_from_b.translation[1])
+                    print(f"[VISION] Cone @ ({X_obj:.2f}, {Y_obj:.2f}) is {dist_goal_wp:.2f}m from CSV waypoint {target_wp_idx} @ ({wp_x:.2f}, {wp_y:.2f}) (search radius: {VISION_SEARCH_RADIUS_M:.2f}m)")
+                else:
+                    print(f"[VISION] Cone @ ({X_obj:.2f}, {Y_obj:.2f}) is {dist_goal_wp:.2f}m from CSV waypoint {target_wp_idx} (search radius: {VISION_SEARCH_RADIUS_M:.2f}m)")
+            else:
+                print(f"[VISION] Warning: Could not determine CSV waypoint location (current_idx={motion_planner.current_waypoint_index}, target_idx={max(1, motion_planner.current_waypoint_index)})")
+            print(f"[VISION] Cone rf: x={x:.2f} y={y:.2f} r={r:.2f} conf={conf:.2f}")
 
-            if not (PROX_OK or CONE_NEAR or FOLLOWING_OK):
-                print("[vision] skip: gate (need near nominal OR cone near OR following+good cone)")
+            # NEW BEHAVIOR: Cone must be within VISION_SEARCH_RADIUS_M of the CSV waypoint (search zone)
+            IN_SEARCH_ZONE = (dist_goal_wp is not None and dist_goal_wp <= VISION_SEARCH_RADIUS_M)
+
+            # Cone quality checks (robot frame): reasonable distance, not too far left/right, good confidence
+            CONE_OK = (0.3 <= r <= 6.0 and abs(y) <= 3.0 and x >= 0.3 and conf >= 0.5)
+
+            # Combined gate: cone must be in search zone AND pass quality checks
+            if not (IN_SEARCH_ZONE and CONE_OK):
+                if not IN_SEARCH_ZONE:
+                    if dist_goal_wp is not None:
+                        print(f"[VISION] skip: cone outside search zone (dist={dist_goal_wp:.2f}m > {VISION_SEARCH_RADIUS_M:.2f}m)")
+                    else:
+                        print(f"[VISION] skip: no CSV waypoint found for search zone validation")
+                elif not CONE_OK:
+                    print(f"[VISION] skip: cone quality check failed (r={r:.2f}, y={y:.2f}, conf={conf:.2f})")
+                continue
+
+            # ---- Check if actuator is deploying ----
+            if getattr(nav_manager, "actuator_deploying", False):
+                print("[VISION] skip: actuator is deploying")
+                continue
+
+            # ---- Check if we've already processed this waypoint ----
+            # target_wp_idx was already calculated by cone_distance_from_csv_waypoint() above
+            # and represents the CSV waypoint we're checking against
+            if target_wp_idx in nav_manager.vision_completed_waypoints:
+                print(f"[VISION] skip: waypoint {target_wp_idx} already processed by vision")
                 continue
 
             # ---- debounce ----
@@ -274,63 +275,46 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             if last_goal is not None:
                 moved = math.hypot(x - last_goal[0], y - last_goal[1])
                 if moved < MIN_DIST_DELTA and (now - last_sent_t) < MIN_PERIOD_S:
-                    print(f"[vision] skip: debounce (moved={moved:.2f}, dt={now-last_sent_t:.2f})")
+                    print(f"[VISION] skip: debounce (moved={moved:.2f}, dt={now-last_sent_t:.2f})")
                     continue
 
-            # ---- don't stack overrides ----
-            if getattr(nav_manager, "vision_active", False):
-                print("[vision] skip: vision_active already true")
+            # ---- Check if robot is waiting at approach position for collar detection ----
+            # Only allow waypoint overrides when robot has stopped at approach waypoint (2m before collar)
+            # This prevents overrides during row-end turns or other maneuvers when heading is incorrect
+            if not getattr(nav_manager, "waiting_for_collar_detection", False):
+                print("[VISION] skip: not at approach position yet, waiting for robot to stop before collar")
                 continue
 
-            # --- Overwrite the next waypoint with the detected object's world coords ---
+            # --- Override waypoint position with cone location ---
             try:
-                idx = await motion_planner.override_next_waypoint_world_xy(X_obj, Y_obj, yaw_rad=yaw)
-                print(f"[vision] replaced next waypoint index {idx} with ({X_obj:.2f}, {Y_obj:.2f})")
+                # Override the next waypoint position with the detected cone position
+                modified_idx = await motion_planner.override_next_waypoint_world_xy(X_obj, Y_obj, yaw_rad=None)
+                print(f"[VISION] Overrode waypoint {modified_idx} position to cone at ({X_obj:.2f}, {Y_obj:.2f})")
+
+                # Mark that we detected a valid cone for the current waypoint
+                nav_manager.cone_detected_for_current_wp = True
+                nav_manager.vision_completed_waypoints.add(target_wp_idx)
+
+                # Log cone detection for visualization
+                cone_detection_record = {
+                    "x": X_obj,
+                    "y": Y_obj,
+                    "waypoint_index": target_wp_idx,
+                    "confidence": conf,
+                    "robot_x": xr,
+                    "robot_y": yr,
+                    "robot_heading": yaw
+                }
+                nav_manager.cone_detections.append(cone_detection_record)
+                logger.info(f"[VISION] Cone detected at ({X_obj:.2f}, {Y_obj:.2f}) for waypoint {target_wp_idx}, nav manager will execute track")
+
+                # Update last goal for debouncing
+                last_goal = (x, y)
+                last_sent_t = now
+
             except Exception as e:
-                print(f"[vision] override waypoint failed: {e}")
+                print(f"[VISION] Failed to override waypoint: {e}")
                 continue
-
-            print("[vision] OK → cancel + set_track + start (to new waypoint)")
-
-            # --- Drive to the (replaced) next waypoint like a normal AB segment ---
-            if hasattr(nav_manager, "vision_active"):
-                nav_manager.vision_active = True
-
-            try:
-                async with ctl_lock:
-                    # A) sanity: controllable?
-                    st = await get_state()
-                    if not controllable_from_state(st):
-                        try:
-                            await controller_client.request_reply("/pause", Empty())
-                            print("[vision] paused follower mid-run (auto mode disabled)")
-                        except Exception as e:
-                            print(f"[vision] pause mid-run failed: {e}")
-                        break
-
-
-                    # B) cancel current
-                    try:
-                        await controller_client.request_reply("/cancel", Empty())
-                    except Exception:
-                        pass
-
-                    # C) wait until not FOLLOWING
-                    try:
-                        await wait_until(lambda s: s.status != TrackStatusEnum.TRACK_FOLLOWING, timeout=3.0)
-                    except TimeoutError:
-                        print("[vision] warn: still FOLLOWING after cancel; proceeding")
-
-                    # D) build normal AB segment to *next* waypoint and replace+start
-                    #    (this increments current_waypoint_index internally)
-                    track_to_next = await motion_planner._create_ab_segment_to_next_waypoint()
-                    await nav_manager.replace_track_and_start(track_to_next)
-
-                    print("[vision] start sent; heading to replaced waypoint")
-            finally:
-                if hasattr(nav_manager, "vision_active"):
-                    nav_manager.vision_active = False
-                await asyncio.sleep(0.1)
 
     except asyncio.CancelledError:
         pass
@@ -386,7 +370,7 @@ async def main(args) -> None:
         )
 
         asyncio.create_task(
-        vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=10.0)
+        vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=2.0)
         )
         
         setup_signal_handlers(nav_manager=nav_manager)
@@ -443,6 +427,17 @@ async def main(args) -> None:
         except Exception as e:
             logger.error(f"FAILED to save robot positions: {e}")
 
+        # Save cone detections
+        cone_detections_path = Path("./visualization/cone_detections.json")
+        try:
+            cone_detections_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cone_detections_path, "w") as f:
+                json.dump(
+                    getattr(nav_manager, "cone_detections", []), f, indent=2)
+            logger.info(f"Cone detections saved to {cone_detections_path}")
+        except Exception as e:
+            logger.error(f"FAILED to save cone detections: {e}")
+
         if nav_manager and not nav_manager.shutdown_requested:
             await nav_manager._cleanup()
         return
@@ -464,18 +459,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--actuator-id", type=int, default=0,
                         help="H-bridge actuator ID (default: 0)")
-    parser.add_argument(
-        "--actuator-open-seconds",
-        type=float,
-        default=6,
-        help="Duration to drive actuator in OPEN after reaching a waypoint (seconds).",
-    )
-    parser.add_argument(
-        "--actuator-close-seconds",
-        type=float,
-        default=6,
-        help="Duration to drive actuator in CLOSE after reaching a waypoint (seconds).",
-    )
     parser.add_argument(
         "--actuator-rate-hz",
         type=float,

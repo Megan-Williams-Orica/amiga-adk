@@ -50,4 +50,5 @@ async def trigger_dipbob(service_config_path: str = "can0") -> None:
 
     await _send_sig(client, 0x18FF0007, b"\x06\x00\x02\x00\x00\x00\x00\x00")
     await asyncio.sleep(0.02)
-    await _send_sig(client, 0x18FF0007, b"\x07\x00\x02\x00\x00\x00\x00\x00")
+    # Whie pressing button A sends both sigs, this sometimes triggers two drops of the dipper.
+    # await _send_sig(client, 0x18FF0007, b"\x07\x00\x02\x00\x00\x00\x00\x00") 

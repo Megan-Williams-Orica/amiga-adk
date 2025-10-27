@@ -1,11 +1,21 @@
 #!/bin/bash
 source ~/farm-ng-amiga/venv/bin/activate
+
+# Create logs directory if it doesn't exist
+mkdir -p logs
+
+# Generate timestamped log filename
+LOG_FILE="logs/navigation_$(date +%Y%m%d_%H%M%S).log"
+
+# Run with output to both terminal and log file
 python main.py \
  --config ./configs/config.json \
  --tool-config-path ./configs/tool_config.json \
- --waypoints-path ./surveyed-waypoints/powerLinesTest2.csv \
- --last-row-waypoint-index 4 \
+ --waypoints-path ./surveyed-waypoints/physicsLabBack2Lanes.csv \
+ --last-row-waypoint-index 3 \
  --turn-direction left \
- --row-spacing 6.0 \
- --headland-buffer 6.0 \
- --actuator-enabled --actuator-id 0 --actuator-open-seconds 6 --actuator-close-seconds 7
+ --row-spacing 2.8 \
+ --headland-buffer 2.0 \
+ --actuator-enabled --actuator-id 0 --actuator-rate-hz 5.0 2>&1 | tee "$LOG_FILE"
+
+echo "Log saved to: $LOG_FILE"
