@@ -44,6 +44,7 @@ from motion_planner import MotionPlanner
 from utils.navigation_manager import NavigationManager
 from utils.multiclient import MultiClientSubscriber as multi
 from utils.pose_cache import set_latest_pose
+from utils.navigation_state import set_navigation_state
 
 logger = logging.getLogger("Navigation Manager")
 

@@ -16,6 +16,7 @@ from farm_ng.track.track_pb2 import (
 from google.protobuf.empty_pb2 import Empty
 from utils.actuator import BaseActuator, NullActuator
 from utils.canbus import trigger_dipbob
+from utils.navigation_state import set_navigation_state
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +224,8 @@ class NavigationManager:
             try:
                 status_name = TrackStatusEnum.Name(track_status)
                 logger.info(f"Track status changed: {status_name}")
+                # Update Flask GUI state
+                set_navigation_state(track_status=status_name)
             except Exception as e:
                 logger.error(f"ERROR: getting status name: {e}")
 
@@ -469,6 +472,13 @@ class NavigationManager:
 
                         # Wait for CAN bus to settle after actuator deployment
                         await asyncio.sleep(1.0)
+
+                        # 5) Mark waypoint as complete AFTER deployment finishes
+                        from utils.navigation_state import mark_waypoint_complete
+                        self.motion_planner.current_waypoint_index += 1
+                        set_navigation_state(current_waypoint_index=self.motion_planner.current_waypoint_index)
+                        mark_waypoint_complete(self.motion_planner.current_waypoint_index - 1)
+                        logger.info(f"[WAYPOINT] Completed waypoint {self.motion_planner.current_waypoint_index - 1}, now at {self.motion_planner.current_waypoint_index}/{len(self.motion_planner.waypoints)}")
                     finally:
                         # Clear flag when deployment is complete
                         self.actuator_deploying = False
@@ -605,7 +615,10 @@ class NavigationManager:
                     # but doesn't rebuild the track, so we need to rebuild it here
                     if getattr(self, "cone_detected_for_current_wp", False):
                         logger.info("[VISION] Rebuilding track with vision-overridden waypoint position")
-                        track_segment, _ = await self.motion_planner.redo_last_segment()
+
+                        # Regenerate direct approach track with updated waypoint position
+                        track_segment = await self.motion_planner._create_ab_segment_to_next_waypoint(approach_offset_m=0.0)
+                        # segment_name stays the same
 
                     # Reset flag for next waypoint
                     self.cone_detected_for_current_wp = False
