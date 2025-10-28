@@ -55,9 +55,19 @@ header h1 {
 /* Main Grid Layout */
 .main-grid {
     display: grid;
-    grid-template-columns: 1fr 1.5fr 1fr;
+    grid-template-columns: 1fr 1fr 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
     gap: 20px;
     min-height: 80vh;
+}
+
+/* Span 2 rows for waypoint map and control panel */
+.plot-panel {
+    grid-row: span 2;
+}
+
+.control-panel {
+    grid-row: span 2;
 }
 
 .panel {
@@ -117,25 +127,34 @@ header h1 {
 .dot.robot { background: #f59e0b; }
 .dot.detection { background: #a855f7; }
 
-/* Camera Feed */
+/* Camera Feed Panel */
 .camera-panel {
     display: flex;
     flex-direction: column;
 }
 
+/* Detection Plot Panel */
+.detection-panel {
+    display: flex;
+    flex-direction: column;
+}
+
 .video-container {
-    height: 300px;
     position: relative;
     background: #000;
     border-radius: 8px;
     overflow: hidden;
+    aspect-ratio: 1 / 1; /* Square container for 640x640 feed */
+    width: 100%;
+    flex: 1; /* Fill available space in column */
 }
 
 #detection-plot-container {
-    height: 300px;
     background: #1a1a1a;
     border-radius: 8px;
-    margin-top: 10px;
+    aspect-ratio: 1 / 1; /* Match camera feed square aspect ratio */
+    width: 100%;
+    flex: 1; /* Fill available space in column */
 }
 
 #camera-feed {

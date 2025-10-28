@@ -18,7 +18,7 @@
 
         <!-- Main Content Grid -->
         <div class="main-grid">
-            <!-- Left Column: Waypoint Plot -->
+            <!-- Column 1: Waypoint Plot (spans 2 rows) -->
             <div class="panel plot-panel">
                 <h2>Waypoint Map</h2>
                 <div id="plot-container"></div>
@@ -30,7 +30,7 @@
                 </div>
             </div>
 
-            <!-- Center Column: Camera Feed + Detection Scatter Plot -->
+            <!-- Column 2 Row 1: Camera Feed 1 -->
             <div class="panel camera-panel">
                 <h2>Camera Feed</h2>
                 <div class="video-container">
@@ -39,15 +39,18 @@
                         <div class="camera-info">Waiting for camera...</div>
                     </div>
                 </div>
+            </div>
 
-                <h2 style="margin-top: 20px;">Detection Scatter Plot</h2>
+            <!-- Column 3 Row 1: Detection Scatter Plot 1 -->
+            <div class="panel detection-panel">
+                <h2>Detection Scatter Plot</h2>
                 <div id="detection-plot-container"></div>
                 <div class="plot-legend">
                     <span class="legend-item"><span class="dot detection"></span> Detection</span>
                 </div>
             </div>
 
-            <!-- Right Column: Status & Controls -->
+            <!-- Column 4 Row 1: Status & Controls (spans 2 rows) -->
             <div class="panel control-panel">
                 <h2>Robot Status</h2>
                 <div class="status-grid">
@@ -92,6 +95,22 @@
 
                 <h2>System Log</h2>
                 <div id="log-container" class="log-container"></div>
+            </div>
+
+            <!-- Column 2 Row 2: Camera Feed 2 (Placeholder) -->
+            <div class="panel camera-panel">
+                <h2>Camera Feed 2</h2>
+                <div class="video-container" style="display: flex; align-items: center; justify-content: center; color: #666;">
+                    <span>Not Connected</span>
+                </div>
+            </div>
+
+            <!-- Column 3 Row 2: Detection Scatter Plot 2 (Placeholder) -->
+            <div class="panel detection-panel">
+                <h2>Detection Plot 2</h2>
+                <div id="detection-plot-container-2" style="display: flex; align-items: center; justify-content: center; color: #666;">
+                    <span>Not Connected</span>
+                </div>
             </div>
         </div>
     </div>

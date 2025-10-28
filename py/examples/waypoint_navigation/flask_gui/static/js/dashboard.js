@@ -160,6 +160,21 @@ function initializePlot() {
         .attr('class', 'y-axis')
         .style('color', '#9ca3af');
 
+    // Add grid (horizontal lines)
+    svg.append('g')
+        .attr('class', 'grid-y')
+        .style('stroke', '#374151')
+        .style('stroke-opacity', 0.3)
+        .style('stroke-dasharray', '2,2');
+
+    // Add grid (vertical lines)
+    svg.append('g')
+        .attr('class', 'grid-x')
+        .attr('transform', `translate(0,${plotHeight})`)
+        .style('stroke', '#374151')
+        .style('stroke-opacity', 0.3)
+        .style('stroke-dasharray', '2,2');
+
     // Add axis labels
     svg.append('text')
         .attr('class', 'x-label')
@@ -202,6 +217,20 @@ function updatePlot(data) {
     // Update axes
     svg.select('.x-axis').call(d3.axisBottom(xScale).ticks(5));
     svg.select('.y-axis').call(d3.axisLeft(yScale).ticks(5));
+
+    // Update grid (horizontal lines)
+    svg.select('.grid-y')
+        .call(d3.axisLeft(yScale)
+            .ticks(5)
+            .tickSize(-plotWidth)
+            .tickFormat(''));
+
+    // Update grid (vertical lines)
+    svg.select('.grid-x')
+        .call(d3.axisBottom(xScale)
+            .ticks(5)
+            .tickSize(-plotHeight)
+            .tickFormat(''));
 
     // Update waypoint markers
     const circles = svg.selectAll('.waypoint')
@@ -298,8 +327,11 @@ function initializeDetectionPlot() {
         .attr('transform', `translate(${margin.left},${margin.top})`);
 
     // Scales: Y (left/right), X (forward)
-    detectionXScale = d3.scaleLinear().domain([-5, 5]).range([0, detectionPlotWidth]);
-    detectionYScale = d3.scaleLinear().domain([0, 10]).range([detectionPlotHeight, 0]);
+    // Note: X-axis shows Y (left/right) with LEFT being positive, so we flip the domain
+    const MAX_RANGE_X = 5.0;  // meters
+    const MAX_RANGE_Y = 10.0; // meters
+    detectionXScale = d3.scaleLinear().domain([MAX_RANGE_X, -MAX_RANGE_X]).range([0, detectionPlotWidth]); // Flipped for left=positive
+    detectionYScale = d3.scaleLinear().domain([0, MAX_RANGE_Y]).range([detectionPlotHeight, 0]);
 
     // Add axes
     detectionSvg.append('g')
@@ -328,6 +360,119 @@ function initializeDetectionPlot() {
         .attr('y', -45)
         .style('fill', '#9ca3af')
         .text('X (meters) [forward +]');
+
+    // Draw FOV wedge (95° HFOV for RGB camera)
+    drawFOVWedge();
+
+    // Draw range rings
+    drawRangeRings();
+}
+
+function drawFOVWedge() {
+    const MAX_RANGE_X = 5.0;
+    const MAX_RANGE_Y = 10.0;
+    const RGB_HFOV_DEG = 95;
+    const halfFOV = (RGB_HFOV_DEG / 2) * Math.PI / 180;
+
+    // Generate FOV wedge boundaries
+    // In robot frame: +Y is LEFT, -Y is RIGHT
+    // At distance z forward, FOV extends to ±z*tan(halfFOV) in Y
+    const points = 200;
+    const pathPoints = [];
+
+    // Build path: start at origin, trace left edge, then right edge back
+    pathPoints.push([detectionXScale(0), detectionYScale(0)]); // Origin
+
+    // Left edge (positive Y = left)
+    for (let i = 0; i <= points; i++) {
+        const z = (MAX_RANGE_Y * i) / points;
+        const y = z * Math.tan(halfFOV); // Positive Y (left)
+        const yClipped = Math.min(MAX_RANGE_X, y);
+        pathPoints.push([detectionXScale(yClipped), detectionYScale(z)]);
+    }
+
+    // Right edge (negative Y = right), trace backwards
+    for (let i = points; i >= 0; i--) {
+        const z = (MAX_RANGE_Y * i) / points;
+        const y = -z * Math.tan(halfFOV); // Negative Y (right)
+        const yClipped = Math.max(-MAX_RANGE_X, y);
+        pathPoints.push([detectionXScale(yClipped), detectionYScale(z)]);
+    }
+
+    // Draw filled wedge
+    detectionSvg.append('path')
+        .attr('d', d3.line()(pathPoints) + 'Z')
+        .attr('fill', '#3b82f6')
+        .attr('fill-opacity', 0.1)
+        .attr('stroke', 'none');
+
+    // Draw FOV edges (dashed lines)
+    // Left edge line
+    const leftY = Math.min(MAX_RANGE_X, MAX_RANGE_Y * Math.tan(halfFOV));
+    detectionSvg.append('line')
+        .attr('x1', detectionXScale(0))
+        .attr('y1', detectionYScale(0))
+        .attr('x2', detectionXScale(leftY))
+        .attr('y2', detectionYScale(MAX_RANGE_Y))
+        .attr('stroke', '#6b7280')
+        .attr('stroke-dasharray', '4,2')
+        .attr('stroke-width', 1);
+
+    // Right edge line
+    const rightY = Math.max(-MAX_RANGE_X, -MAX_RANGE_Y * Math.tan(halfFOV));
+    detectionSvg.append('line')
+        .attr('x1', detectionXScale(0))
+        .attr('y1', detectionYScale(0))
+        .attr('x2', detectionXScale(rightY))
+        .attr('y2', detectionYScale(MAX_RANGE_Y))
+        .attr('stroke', '#6b7280')
+        .attr('stroke-dasharray', '4,2')
+        .attr('stroke-width', 1);
+}
+
+function drawRangeRings() {
+    const MAX_RANGE_X = 5.0;
+    const MAX_RANGE_Y = 10.0;
+    const RGB_HFOV_DEG = 95;
+    const halfFOV = (RGB_HFOV_DEG / 2) * Math.PI / 180;
+    const ranges = [1, 2, 3, 4, 6]; // meters
+
+    ranges.forEach(r => {
+        // Draw range arc within FOV
+        const points = 360;
+        const arcPoints = [];
+
+        for (let i = 0; i <= points; i++) {
+            const theta = -halfFOV + (2 * halfFOV * i) / points;
+            const x = r * Math.sin(theta);
+            const y = r * Math.cos(theta);
+
+            // Check if point is within bounds
+            if (y >= 0 && y <= MAX_RANGE_Y && Math.abs(x) <= MAX_RANGE_X) {
+                arcPoints.push([detectionXScale(x), detectionYScale(y)]);
+            }
+        }
+
+        if (arcPoints.length > 0) {
+            detectionSvg.append('path')
+                .attr('d', d3.line()(arcPoints))
+                .attr('stroke', '#6b7280')
+                .attr('stroke-dasharray', '2,2')
+                .attr('stroke-width', 1)
+                .attr('fill', 'none')
+                .attr('opacity', 0.5);
+
+            // Add range label
+            if (r <= MAX_RANGE_Y) {
+                detectionSvg.append('text')
+                    .attr('x', detectionXScale(0.2))
+                    .attr('y', detectionYScale(r * 0.98))
+                    .attr('font-size', '10px')
+                    .attr('fill', '#9ca3af')
+                    .text(`${r}m`);
+            }
+        }
+    });
 }
 
 function updateDetectionPlot(detections) {
