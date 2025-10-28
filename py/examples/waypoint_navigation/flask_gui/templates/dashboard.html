@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Amiga Waypoint Navigation</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <h1>🤖 Amiga Waypoint Navigation</h1>
+            <div id="connection-status" class="status-badge disconnected">Disconnected</div>
+        </header>
+
+        <!-- Main Content Grid -->
+        <div class="main-grid">
+            <!-- Left Column: Waypoint Plot -->
+            <div class="panel plot-panel">
+                <h2>Waypoint Map</h2>
+                <div id="plot-container"></div>
+                <div class="plot-legend">
+                    <span class="legend-item"><span class="dot pending"></span> Pending</span>
+                    <span class="legend-item"><span class="dot current"></span> Current</span>
+                    <span class="legend-item"><span class="dot completed"></span> Completed</span>
+                    <span class="legend-item"><span class="dot robot"></span> Robot</span>
+                </div>
+            </div>
+
+            <!-- Center Column: Camera Feed + Detection Scatter Plot -->
+            <div class="panel camera-panel">
+                <h2>Camera Feed</h2>
+                <div class="video-container">
+                    <img id="camera-feed" src="{{ url_for('video_feed') }}" alt="Camera Feed">
+                    <div id="camera-overlay">
+                        <div class="camera-info">Waiting for camera...</div>
+                    </div>
+                </div>
+
+                <h2 style="margin-top: 20px;">Detection Scatter Plot</h2>
+                <div id="detection-plot-container"></div>
+                <div class="plot-legend">
+                    <span class="legend-item"><span class="dot detection"></span> Detection</span>
+                </div>
+            </div>
+
+            <!-- Right Column: Status & Controls -->
+            <div class="panel control-panel">
+                <h2>Robot Status</h2>
+                <div class="status-grid">
+                    <div class="status-item">
+                        <label>Position X:</label>
+                        <span id="pos-x">--</span>
+                    </div>
+                    <div class="status-item">
+                        <label>Position Y:</label>
+                        <span id="pos-y">--</span>
+                    </div>
+                    <div class="status-item">
+                        <label>Heading:</label>
+                        <span id="heading">--</span>
+                    </div>
+                    <div class="status-item">
+                        <label>Waypoint:</label>
+                        <span id="waypoint">-- / --</span>
+                    </div>
+                    <div class="status-item">
+                        <label>Track Status:</label>
+                        <span id="track-status" class="badge">IDLE</span>
+                    </div>
+                    <div class="status-item">
+                        <label>GPS Quality:</label>
+                        <span id="gps-quality" class="badge">UNKNOWN</span>
+                    </div>
+                </div>
+
+                <h2>Navigation Controls</h2>
+                <div class="controls">
+                    <button id="btn-start" class="btn btn-success" onclick="startNavigation()">
+                        ▶️ Start Navigation
+                    </button>
+                    <button id="btn-stop" class="btn btn-warning" onclick="stopNavigation()" disabled>
+                        ⏸️ Stop Navigation
+                    </button>
+                    <button id="btn-emergency" class="btn btn-danger" onclick="emergencyStop()">
+                        🛑 EMERGENCY STOP
+                    </button>
+                </div>
+
+                <h2>System Log</h2>
+                <div id="log-container" class="log-container"></div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/dashboard.js') }}"></script>
+</body>
+</html>
