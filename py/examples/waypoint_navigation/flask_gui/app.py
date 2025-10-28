@@ -14,13 +14,20 @@ import threading
 import subprocess
 import signal
 import time
+import asyncio
 from typing import Optional
 
 # Add parent directory to path to import from navigation system
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-from utils.pose_cache import get_latest_pose
+from utils.pose_cache import get_latest_pose, set_latest_pose
 from utils.navigation_state import get_navigation_state, get_waypoint_status
 from utils.camera_frame_cache import get_latest_frame_bytes
+
+# Import filter client dependencies
+from farm_ng.core.event_client import EventClient
+from farm_ng.core.event_service_pb2 import EventServiceConfig
+from farm_ng.core.events_file_reader import proto_from_json_file
+from farm_ng_core_pybind import Pose3F64
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your-secret-key-here'
@@ -93,9 +100,9 @@ def plot_data():
     pose = get_latest_pose()
     if pose is not None:
         robot_data = {
-            'x': float(pose.a_from_b.translation[0]),
-            'y': float(pose.a_from_b.translation[1]),
-            'heading': float(pose.a_from_b.rotation.log()[-1])
+            'x': pose.x,
+            'y': pose.y,
+            'heading': pose.yaw
         }
 
     # Get navigation state
@@ -143,18 +150,18 @@ def robot_status():
         'track_status': nav_state['track_status'],
         'current_waypoint': nav_state['current_waypoint_index'],
         'total_waypoints': nav_state['total_waypoints'],
-        'gps_quality': nav_state['gps_quality'],
+        'filter_converged': False,  # Default if no pose available
         'vision_active': nav_state['vision_active'],
         'pose': None
     }
 
     if pose is not None:
         import math
-        heading_rad = float(pose.a_from_b.rotation.log()[-1])
+        status['filter_converged'] = pose.converged
         status['pose'] = {
-            'x': float(pose.a_from_b.translation[0]),
-            'y': float(pose.a_from_b.translation[1]),
-            'heading_deg': math.degrees(heading_rad)
+            'x': pose.x,
+            'y': pose.y,
+            'heading_deg': math.degrees(pose.yaw)
         }
 
     return jsonify(status)
@@ -298,6 +305,52 @@ def load_waypoint_data():
 
     return waypoints
 
+async def filter_pose_updater():
+    """Subscribe to filter state and continuously update pose cache"""
+    try:
+        # Load filter service config from parent directory
+        filter_config_path = Path(__file__).resolve().parents[1] / 'configs' / 'config.json'
+
+        # Create filter client
+        from farm_ng.core.event_service_pb2 import EventServiceConfigList, SubscribeRequest
+        config_list = proto_from_json_file(filter_config_path, EventServiceConfigList())
+
+        # Find filter service config
+        filter_config = None
+        for config in config_list.configs:
+            if config.name == "filter":
+                filter_config = config
+                break
+
+        if filter_config is None:
+            print("⚠️  Filter service not found in config, pose updates disabled")
+            return
+
+        # Create subscription request manually (since it's not in config)
+        from farm_ng.core.uri_pb2 import Uri
+        subscription = SubscribeRequest(
+            uri=Uri(path="/state", query="service_name=filter"),
+            every_n=1
+        )
+
+        # Subscribe to filter state
+        client = EventClient(filter_config)
+        print(f"✓ Subscribed to filter service at {filter_config.host}:{filter_config.port}")
+
+        async for event, message in client.subscribe(subscription, decode=True):
+            # Update pose cache with filter state
+            pose = Pose3F64.from_proto(message.pose)
+            x = float(pose.a_from_b.translation[0])
+            y = float(pose.a_from_b.translation[1])
+            yaw = float(pose.a_from_b.rotation.log()[-1])
+            converged = bool(getattr(message, "has_converged", False))
+            set_latest_pose(x, y, yaw, converged)
+
+    except Exception as e:
+        print(f"⚠️  Filter pose updater error: {e}")
+        import traceback
+        traceback.print_exc()
+
 def background_status_updater():
     """Background thread to emit status updates to all clients"""
     while True:
@@ -322,7 +375,7 @@ def background_status_updater():
                 'track_status': nav_state['track_status'],
                 'current_waypoint': nav_state['current_waypoint_index'],
                 'total_waypoints': nav_state['total_waypoints'],
-                'gps_quality': nav_state['gps_quality'],
+                'filter_converged': False,  # Default if no pose available
                 'vision_active': nav_state['vision_active']
             }
 
@@ -330,11 +383,11 @@ def background_status_updater():
             pose = get_latest_pose()
             if pose is not None:
                 import math
-                heading_rad = float(pose.a_from_b.rotation.log()[-1])
+                status['filter_converged'] = pose.converged
                 status['pose'] = {
-                    'x': float(pose.a_from_b.translation[0]),
-                    'y': float(pose.a_from_b.translation[1]),
-                    'heading_deg': math.degrees(heading_rad)
+                    'x': pose.x,
+                    'y': pose.y,
+                    'heading_deg': math.degrees(pose.yaw)
                 }
 
             socketio.emit('status_update', status)
@@ -346,7 +399,18 @@ def background_status_updater():
 
 # ==================== Main ====================
 
+def run_async_filter_updater():
+    """Run the async filter updater in its own event loop"""
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(filter_pose_updater())
+
 if __name__ == '__main__':
+    # Start background filter pose updater
+    filter_thread = threading.Thread(target=run_async_filter_updater, daemon=True)
+    filter_thread.start()
+
     # Start background status updater
     status_thread = threading.Thread(target=background_status_updater, daemon=True)
     status_thread.start()

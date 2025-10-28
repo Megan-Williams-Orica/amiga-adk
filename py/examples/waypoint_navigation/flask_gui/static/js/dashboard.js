@@ -75,9 +75,9 @@ function updateRobotStatus(status) {
     const trackBadge = document.getElementById('track-status');
     trackBadge.textContent = status.track_status;
 
-    // Update GPS quality
-    const gpsBadge = document.getElementById('gps-quality');
-    gpsBadge.textContent = status.gps_quality || 'UNKNOWN';
+    // Update filter convergence
+    const filterBadge = document.getElementById('filter-converged');
+    filterBadge.textContent = status.filter_converged ? 'YES' : 'NO';
 
     // Update button states
     const btnStart = document.getElementById('btn-start');

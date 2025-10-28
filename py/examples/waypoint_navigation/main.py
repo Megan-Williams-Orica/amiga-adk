@@ -84,7 +84,10 @@ def _update_pose_from_filter(filter_msg) -> None:
     # or if heading is provided directly:
     yaw_rad = float(getattr(filter_msg, "pose_yaw_rad", 0.0))
 
-    set_latest_pose(x_m, y_m, yaw_rad)
+    # Filter convergence status
+    converged = bool(getattr(filter_msg, "has_converged", False))
+
+    set_latest_pose(x_m, y_m, yaw_rad, converged)
         
 # Vision configuration
 VISION_SEARCH_RADIUS_M = 1.0  # Search radius around CSV waypoints for cone detection

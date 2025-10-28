@@ -35,6 +35,7 @@ from farm_ng_core_pybind import Rotation3F64
 from google.protobuf.empty_pb2 import Empty
 from track_planner import TrackBuilder
 from utils.navigation_state import set_navigation_state, mark_waypoint_complete
+from utils.pose_cache import set_latest_pose
 
 
 def _poses_from_csv(csv_path: Path) -> dict[int, Pose3F64]:
@@ -123,7 +124,16 @@ async def get_current_pose(client: EventClient | None = None, timeout: float = 5
             state: FilterState = await asyncio.wait_for(
                 client.request_reply("/get_state", Empty(), decode=True), timeout=timeout
             )
-            return Pose3F64.from_proto(state.pose)
+
+            # Update pose cache with filter state for Flask GUI
+            pose = Pose3F64.from_proto(state.pose)
+            x = float(pose.a_from_b.translation[0])
+            y = float(pose.a_from_b.translation[1])
+            yaw = float(pose.a_from_b.rotation.log()[-1])
+            converged = bool(getattr(state, "has_converged", False))
+            set_latest_pose(x, y, yaw, converged)
+
+            return pose
         except asyncio.TimeoutError:
             logger.info(
                 "Timeout while getting filter state. Using default start pose.")
@@ -256,6 +266,8 @@ class MotionPlanner:
             except Exception as e:
                 logger.error(f"Error updating current pose: {e}")
                 return None
+
+            await asyncio.sleep(0.1)  # Poll at 10 Hz
 
     async def _get_current_pose(self) -> Pose3F64:
         """Get the current pose of the Amiga.
