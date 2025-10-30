@@ -307,10 +307,31 @@ class MotionPlanner:
         # Determine which waypoint to replace (the current target)
         idx = max(1, self.current_waypoint_index)
 
-        # Use current heading if none provided
+        # Use current heading if none provided, except for last row waypoint
         if yaw_rad is None:
-            pose_now = await self._get_current_pose()
-            yaw_rad = float(pose_now.a_from_b.rotation.log()[-1])
+            # Special handling for last waypoint of the row: use row direction instead of robot heading
+            if idx == self.last_row_waypoint_index:
+                # Calculate heading from first waypoint of row to last waypoint of row
+                # Assuming waypoint 1 is first of row, and last_row_waypoint_index is last
+                first_row_wp = self.original_csv_waypoints.get(1)
+                if first_row_wp is not None:
+                    first_x = float(first_row_wp.a_from_b.translation[0])
+                    first_y = float(first_row_wp.a_from_b.translation[1])
+
+                    # Calculate heading from first to last waypoint of row (row direction)
+                    dx = X_w - first_x  # north component
+                    dy = Y_w - first_y  # west component
+                    yaw_rad = float(np.arctan2(dy, dx))
+
+                    logger.info(f"[VISION] Using row direction heading for last row WP{idx}: {np.degrees(yaw_rad):.1f}° (from first row WP at ({first_x:.2f}, {first_y:.2f}) to ({X_w:.2f}, {Y_w:.2f}))")
+                else:
+                    # Fallback to robot heading if can't find first waypoint
+                    pose_now = await self._get_current_pose()
+                    yaw_rad = float(pose_now.a_from_b.rotation.log()[-1])
+            else:
+                # Normal waypoint: use robot's current heading (allows smooth turns)
+                pose_now = await self._get_current_pose()
+                yaw_rad = float(pose_now.a_from_b.rotation.log()[-1])
 
         # Build world_from_hole pose (vision detects collar/hole position)
         iso_hole = Isometry3F64([float(X_w), float(Y_w), 0.0], Rotation3F64.Rz(float(yaw_rad)))

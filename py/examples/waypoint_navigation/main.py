@@ -203,10 +203,10 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                 The search zone is centered at the current target waypoint.
                 """
                 # Get the original CSV waypoint for the current target waypoint
-                # Since _create_ab_segment_to_next_waypoint() increments BEFORE building,
-                # current_waypoint_index already points to the waypoint we're navigating toward
+                # For approach segments, current_waypoint_index points to the LAST COMPLETED waypoint,
+                # so we need to check the NEXT waypoint (current_waypoint_index + 1)
                 csv_waypoint = None
-                idx = max(1, motion_planner.current_waypoint_index)
+                idx = max(1, motion_planner.current_waypoint_index + 1)
 
                 if hasattr(motion_planner, "original_csv_waypoints"):
                     csv_waypoint = motion_planner.original_csv_waypoints.get(idx)

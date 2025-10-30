@@ -6,7 +6,7 @@ import depthai as dai
 import numpy as np
 
 # Check if headless mode is enabled (for Flask integration) - MUST be before matplotlib imports
-HEADLESS_MODE = os.getenv('DETECTION_HEADLESS', '0') == '1'
+HEADLESS_MODE = os.getenv('DETECTION_HEADLESS', '0') == '0'
 
 import matplotlib
 if HEADLESS_MODE:
@@ -236,7 +236,7 @@ def add_spatial_to_detections(detections: List[dict], depth_frame: np.ndarray,
             geometric_available = False
     else:
         geometric_available = False
-        print("[GEOM] Geometric correction disabled by parameter")
+        # print("[GEOM] Geometric correction disabled by parameter")
 
     for det in detections:
         # Use center of bounding box
@@ -915,6 +915,31 @@ with pipeline:
                     json.dump(detection_data, f)
             except Exception:
                 pass
+
+            # ALWAYS emit closest detection (regardless of headless mode)
+            # Find closest detection and send UDP message
+            closest_detection = None
+            closest_distance = float('inf')
+            for det in spatial_detections:
+                p_cam = np.array([
+                    det.spatialCoordinates.x,
+                    det.spatialCoordinates.y,
+                    det.spatialCoordinates.z
+                ]) / 1000.0
+
+                robot_pose = xfm.robot_pose_from_cam_point(p_cam)
+                v_r = np.array(robot_pose.a_from_b.translation)
+                x_fwd, y_left = v_r[0], v_r[1]
+
+                distance = math.hypot(x_fwd, y_left)
+                if distance < closest_distance:
+                    closest_distance = distance
+                    closest_detection = (x_fwd, y_left, det.confidence, det.label)
+
+            # Emit the closest detection
+            if closest_detection is not None:
+                x_fwd, y_left, conf, label = closest_detection
+                maybe_emit_cone_goal(x_fwd, y_left, conf, label, list(detector.class_names.values()))
 
             # Update matplotlib figure with both views (skip in headless mode)
             if vis is not None:

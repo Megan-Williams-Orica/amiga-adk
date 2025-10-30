@@ -438,6 +438,8 @@ class NavigationManager:
 
             if success:
                 logger.info("SUCCESS: Track segment completed")
+
+                # Perform deployment actions if requested
                 if do_post_actions and self.actuator_enabled:
                     # Set flag to disable vision during deployment
                     self.actuator_deploying = True
@@ -454,34 +456,36 @@ class NavigationManager:
                         # 3) Move forward so robot origin is over the hole
                         origin_track = await self.motion_planner.create_tool_to_origin_segment()
                         ok2 = await self.execute_single_track(origin_track, timeout=15.0, do_post_actions=False)
-                        if not ok2:
+
+                        if ok2:
+                            # 4) Open/close chute (only if tool-to-origin succeeded)
+                            await self.actuator.pulse_sequence(
+                                open_seconds=self.actuator_open_seconds,
+                                close_seconds=self.actuator_close_seconds,
+                                rate_hz=self.actuator_rate_hz,
+                                settle_before=3.0,
+                                settle_between=0.0,
+                                wait_for_enter_between=False,
+                                enter_prompt="Hole measured. Press ENTER to close the chute...",
+                                enter_timeout=30.0,      # safety timeout
+                            )
+
+                            # Wait for CAN bus to settle after actuator deployment
+                            await asyncio.sleep(1.0)
+                        else:
                             logger.warning("tool→origin micro-segment failed; skipping chute pulse")
-                            return success  # don't open chute if failed
-
-                        # 4) Open/close chute
-                        await self.actuator.pulse_sequence(
-                            open_seconds=self.actuator_open_seconds,
-                            close_seconds=self.actuator_close_seconds,
-                            rate_hz=self.actuator_rate_hz,
-                            settle_before=3.0,
-                            settle_between=0.0,
-                            wait_for_enter_between=False,
-                            enter_prompt="Hole measured. Press ENTER to close the chute...",
-                            enter_timeout=30.0,      # safety timeout
-                        )
-
-                        # Wait for CAN bus to settle after actuator deployment
-                        await asyncio.sleep(1.0)
-
-                        # 5) Mark waypoint as complete AFTER deployment finishes
-                        from utils.navigation_state import mark_waypoint_complete
-                        self.motion_planner.current_waypoint_index += 1
-                        set_navigation_state(current_waypoint_index=self.motion_planner.current_waypoint_index)
-                        mark_waypoint_complete(self.motion_planner.current_waypoint_index - 1)
-                        logger.info(f"[WAYPOINT] Completed waypoint {self.motion_planner.current_waypoint_index - 1}, now at {self.motion_planner.current_waypoint_index}/{len(self.motion_planner.waypoints)}")
                     finally:
                         # Clear flag when deployment is complete
                         self.actuator_deploying = False
+
+                # Mark waypoint as complete AFTER any deployment actions
+                # This must happen for ALL waypoint completions, regardless of actuator state
+                if do_post_actions:
+                    from utils.navigation_state import mark_waypoint_complete
+                    self.motion_planner.current_waypoint_index += 1
+                    set_navigation_state(current_waypoint_index=self.motion_planner.current_waypoint_index)
+                    mark_waypoint_complete(self.motion_planner.current_waypoint_index - 1)
+                    logger.info(f"[WAYPOINT] Completed waypoint {self.motion_planner.current_waypoint_index - 1}, now at {self.motion_planner.current_waypoint_index}/{len(self.motion_planner.waypoints)}")
             else:
                 logger.warning("ERROR: Track segment failed or timed out")
 
@@ -643,6 +647,12 @@ class NavigationManager:
                             f"Moving robot forward | Failed attempts: {failed_attempts}")
                         failed_attempts = 0
                     track_segment, segment_name = await self.motion_planner.redo_last_segment()
+
+                    # Check if redo_last_segment returned None (no previous segment)
+                    if track_segment is None or segment_name is None:
+                        logger.error("Cannot redo segment - no previous segment available. Stopping navigation.")
+                        break
+
                     # Preserve segment type: no deployment for row-end or approach segments
                     is_waypoint_segment = "waypoint" in segment_name.lower() and "row_end" not in segment_name.lower()
                     is_approach_segment = "approach" in segment_name.lower()
