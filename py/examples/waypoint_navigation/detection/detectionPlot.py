@@ -963,9 +963,15 @@ with pipeline:
                 break
 
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
+        print("\nInterrupted by user (Ctrl+C)")
     finally:
         cv2.destroyAllWindows()
         plt.ioff()
-        if plt.fignum_exists(vis.fig.number):
-            plt.close(vis.fig)
+        # Only close figure if vis exists and has a figure
+        if vis is not None and hasattr(vis, 'fig') and vis.fig is not None:
+            try:
+                if plt.fignum_exists(vis.fig.number):
+                    plt.close(vis.fig)
+            except Exception:
+                pass  # Ignore cleanup errors
+        print("\nDetection script exited cleanly")

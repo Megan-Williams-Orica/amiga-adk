@@ -34,7 +34,7 @@ from farm_ng_core_pybind import Pose3F64
 from farm_ng_core_pybind import Rotation3F64
 from google.protobuf.empty_pb2 import Empty
 from track_planner import TrackBuilder
-from utils.navigation_state import set_navigation_state, mark_waypoint_complete
+from utils.navigation_state import set_navigation_state
 from utils.pose_cache import set_latest_pose
 
 
@@ -298,40 +298,16 @@ class MotionPlanner:
         Replace the current target waypoint with a world pose at (X_w, Y_w). Heading defaults to current robot yaw.
         Returns the waypoint index that was modified.
 
-        Since _create_ab_segment_to_next_waypoint() increments current_waypoint_index BEFORE building the track,
-        current_waypoint_index already points to the waypoint we're currently navigating toward.
-
         NOTE: (X_w, Y_w) represents the HOLE/COLLAR position. This method applies the tool offset
         transformation to calculate where the robot center should be, just like CSV waypoint loading does.
         """
         # Determine which waypoint to replace (the current target)
         idx = max(1, self.current_waypoint_index)
 
-        # Use current heading if none provided, except for last row waypoint
+        # Use current heading if none provided
         if yaw_rad is None:
-            # Special handling for last waypoint of the row: use row direction instead of robot heading
-            if idx == self.last_row_waypoint_index:
-                # Calculate heading from first waypoint of row to last waypoint of row
-                # Assuming waypoint 1 is first of row, and last_row_waypoint_index is last
-                first_row_wp = self.original_csv_waypoints.get(1)
-                if first_row_wp is not None:
-                    first_x = float(first_row_wp.a_from_b.translation[0])
-                    first_y = float(first_row_wp.a_from_b.translation[1])
-
-                    # Calculate heading from first to last waypoint of row (row direction)
-                    dx = X_w - first_x  # north component
-                    dy = Y_w - first_y  # west component
-                    yaw_rad = float(np.arctan2(dy, dx))
-
-                    logger.info(f"[VISION] Using row direction heading for last row WP{idx}: {np.degrees(yaw_rad):.1f}° (from first row WP at ({first_x:.2f}, {first_y:.2f}) to ({X_w:.2f}, {Y_w:.2f}))")
-                else:
-                    # Fallback to robot heading if can't find first waypoint
-                    pose_now = await self._get_current_pose()
-                    yaw_rad = float(pose_now.a_from_b.rotation.log()[-1])
-            else:
-                # Normal waypoint: use robot's current heading (allows smooth turns)
-                pose_now = await self._get_current_pose()
-                yaw_rad = float(pose_now.a_from_b.rotation.log()[-1])
+            pose_now = await self._get_current_pose()
+            yaw_rad = float(pose_now.a_from_b.rotation.log()[-1])
 
         # Build world_from_hole pose (vision detects collar/hole position)
         iso_hole = Isometry3F64([float(X_w), float(Y_w), 0.0], Rotation3F64.Rz(float(yaw_rad)))
@@ -510,8 +486,7 @@ class MotionPlanner:
         track_builder.create_ab_segment(
             next_frame_b="waypoint_1", final_pose=goal_pose, spacing=0.1)
 
-        # NOTE: Don't increment waypoint here - will be incremented after deployment in navigation_manager
-        logger.info(f"[WAYPOINT] Approaching waypoint {self.current_waypoint_index + 1}/{len(self.waypoints)}")
+        self.current_waypoint_index += 1
 
         return track_builder.track
 
@@ -535,8 +510,7 @@ class MotionPlanner:
         track_builder.create_ab_segment(
             next_frame_b="waypoint_1", final_pose=goal_pose, spacing=0.1)
 
-        # NOTE: Don't increment waypoint here - will be incremented after deployment in navigation_manager
-        logger.info(f"[WAYPOINT] Approaching waypoint {self.current_waypoint_index + 1}/{len(self.waypoints)}")
+        self.current_waypoint_index += 1
 
         return track_builder.track
 
@@ -554,14 +528,12 @@ class MotionPlanner:
 
         # 2. Create the track (AB) segment to the next waypoint
         track_builder = TrackBuilder(start=current_pose)
+        self.current_waypoint_index += 1
 
-        # Increment to get next waypoint index
-        next_wp_index = self.current_waypoint_index + 1
-        target_pose = self.waypoints[next_wp_index]
+        target_pose = self.waypoints[self.current_waypoint_index]
 
         # If approach_offset_m is specified, create intermediate approach waypoint
         if approach_offset_m > 0.0:
-            # DON'T increment current_waypoint_index yet - will increment after final approach completes
             # Calculate position 2m before the target waypoint
             current_x = current_pose.a_from_b.translation[0]
             current_y = current_pose.a_from_b.translation[1]
@@ -584,23 +556,19 @@ class MotionPlanner:
             approach_pose = Pose3F64(
                 a_from_b=approach_iso,
                 frame_a="world",
-                frame_b=f"approach_{next_wp_index}"
+                frame_b=f"approach_{self.current_waypoint_index}"
             )
 
             # Build track to approach waypoint (not full waypoint yet)
             track_builder.create_ab_segment(
-                next_frame_b=f"approach_{next_wp_index}",
+                next_frame_b=f"approach_{self.current_waypoint_index}",
                 final_pose=approach_pose,
                 spacing=0.1,
             )
-            # Don't update state yet - final approach will do it
         else:
-            # Standard behavior - go directly to waypoint (no approach phase)
-            # NOTE: Don't increment here - will be incremented after deployment in navigation_manager
-            logger.info(f"[WAYPOINT] Direct approach to waypoint {next_wp_index}/{len(self.waypoints)}")
-
+            # Standard behavior - go directly to waypoint
             track_builder.create_ab_segment(
-                next_frame_b=f"waypoint_{next_wp_index}",
+                next_frame_b=f"waypoint_{self.current_waypoint_index}",
                 final_pose=target_pose,
                 spacing=0.1,
             )
@@ -612,24 +580,16 @@ class MotionPlanner:
 
         This is called after stopping at the approach waypoint and detecting the collar.
         Returns a track from current position to the waypoint (which may have been overridden by vision).
-
-        NOTE: This does NOT increment the waypoint index. The waypoint is only marked as
-        complete AFTER the actuator deployment finishes in navigation_manager.py.
         """
-        # Get the next waypoint index (the one we're approaching) without incrementing
-        next_wp_index = self.current_waypoint_index + 1
         current_pose = await self._get_current_pose()
-        target_pose = self.waypoints[next_wp_index]
+        target_pose = self.waypoints[self.current_waypoint_index]
 
         track_builder = TrackBuilder(start=current_pose)
         track_builder.create_ab_segment(
-            next_frame_b=f"waypoint_{next_wp_index}",
+            next_frame_b=f"waypoint_{self.current_waypoint_index}",
             final_pose=target_pose,
             spacing=0.1,
         )
-
-        logger.info(f"[WAYPOINT] Final approach to waypoint {next_wp_index}/{len(self.waypoints)}")
-
         return track_builder.track
 
     async def _row_end_maneuver(self, index: int) -> Track:
