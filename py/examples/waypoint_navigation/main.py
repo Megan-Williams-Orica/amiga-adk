@@ -45,6 +45,7 @@ from utils.navigation_manager import NavigationManager
 from utils.multiclient import MultiClientSubscriber as multi
 from utils.pose_cache import set_latest_pose
 from utils.navigation_state import set_navigation_state
+from utils.canbus import imu_wiggle
 
 logger = logging.getLogger("Navigation Manager")
 
@@ -376,9 +377,29 @@ async def main(args) -> None:
         asyncio.create_task(
         vision_goal_listener(motion_planner, controller_client, nav_manager, proximity_m=2.0)
         )
-        
+
         setup_signal_handlers(nav_manager=nav_manager)
         nav_manager.main_task = asyncio.current_task()
+
+        # Check if filter has converged, and wiggle if needed
+        logger.info("Checking filter convergence before starting navigation...")
+        if canbus_client is not None:
+            converged = await imu_wiggle(
+                canbus_client=canbus_client,
+                filter_client=filter_client,
+                duration_seconds=3.0,
+                angular_velocity=0.3,
+                check_convergence=True,
+                max_attempts=3
+            )
+
+            if not converged:
+                logger.warning("Filter did not converge after wiggle attempts. Navigation may fail.")
+                logger.warning("Consider manually shaking the robot or restarting the filter service.")
+            else:
+                logger.info("Filter converged successfully, ready for navigation!")
+        else:
+            logger.warning("CAN bus client not available, skipping IMU wiggle")
 
         # Run navigation
         await nav_manager.run_navigation()

@@ -38,11 +38,17 @@ from utils.navigation_state import set_navigation_state
 from utils.pose_cache import set_latest_pose
 
 
-def _poses_from_csv(csv_path: Path) -> dict[int, Pose3F64]:
+def _poses_from_csv(csv_path: Path, last_row_waypoint_index: int | None = None) -> dict[int, Pose3F64]:
     """
     Load ENU waypoints from CSV with columns:
       - dx (Easting, meters), dy (Northing, meters)
       - optional: yaw_deg (heading along row, degrees). If omitted, we'll infer from neighbors.
+
+    Args:
+        csv_path: Path to the CSV file
+        last_row_waypoint_index: Index of the last waypoint in the first row (1-indexed).
+                                 This waypoint will use backward difference for heading inference
+                                 to align with approach direction, not exit direction.
 
     Returns a dict of Pose3F64 representing *world_from_hole* in NWU, 1-indexed,
     matching what the JSON Track loader produced.
@@ -68,6 +74,19 @@ def _poses_from_csv(csv_path: Path) -> dict[int, Pose3F64]:
             dy_w[:-1] = west[1:] - west[:-1]
             dx_n[-1] = north[-1] - north[-2]
             dy_w[-1] = west[-1] - west[-2]
+
+            # Special handling for last_row_waypoint: use backward difference (approach direction)
+            # This ensures the waypoint is oriented toward the direction the robot is traveling
+            # when it arrives, not where it's going next (which may involve row-end maneuvers)
+            if last_row_waypoint_index is not None and 1 <= last_row_waypoint_index <= len(north):
+                # The poses dict uses enumerate(start=1), so CSV row with ID=N becomes waypoint N+1
+                # If last_row_waypoint_index=3, that's CSV row ID=2 (3rd row of data), at array index 2
+                idx = last_row_waypoint_index - 1  # Convert from 1-indexed waypoint to 0-indexed array
+                if idx > 0:  # Can only use backward difference if not the first waypoint
+                    dx_n[idx] = north[idx] - north[idx - 1]
+                    dy_w[idx] = west[idx] - west[idx - 1]
+                    logger.info(f"Using backward difference for waypoint {last_row_waypoint_index} (array index {idx}) heading (last row waypoint)")
+
         # In NWU, yaw is atan2(Y_west, X_north)
         yaw = np.arctan2(dy_w, dx_n)
 
@@ -178,7 +197,7 @@ class MotionPlanner:
         try:
             # Load waypoints either from Track JSON or CSV
             if waypoints_path.suffix.lower() == ".csv":
-                waypoints_dict = _poses_from_csv(waypoints_path)
+                waypoints_dict = _poses_from_csv(waypoints_path, last_row_waypoint_index=last_row_waypoint_index)
             else:
                 track: Track = proto_from_json_file(waypoints_path, Track())
                 waypoints_dict = {i: Pose3F64.from_proto(
@@ -482,9 +501,38 @@ class MotionPlanner:
             next_frame_b="aligned_to_goal_heading", angle=turn_to_goal_heading, spacing=0.05
         )
 
-        # Step 4: Drive straight to goal
-        track_builder.create_ab_segment(
-            next_frame_b="waypoint_1", final_pose=goal_pose, spacing=0.1)
+        # Step 4: Drive straight to goal - check if we should use approach offset
+        # Calculate distance from laterally aligned position to goal
+        longitudinal_distance = analysis['longitudinal_distance']
+
+        APPROACH_OFFSET = 1.5
+        if longitudinal_distance > APPROACH_OFFSET + 0.5:  # Add 0.5m buffer
+            # Robot is far - use approach waypoint
+            current_x = current_pose.a_from_b.translation[0]
+            current_y = current_pose.a_from_b.translation[1]
+            goal_x = goal_pose.a_from_b.translation[0]
+            goal_y = goal_pose.a_from_b.translation[1]
+
+            approach_x, approach_y = _offset_towards(
+                (current_x, current_y),
+                (goal_x, goal_y),
+                APPROACH_OFFSET
+            )
+            approach_iso = Isometry3F64(
+                np.array([approach_x, approach_y, 0.0], dtype=np.float64),
+                goal_pose.a_from_b.rotation
+            )
+            approach_pose = Pose3F64(
+                a_from_b=approach_iso,
+                frame_a="world",
+                frame_b="approach_1"
+            )
+            track_builder.create_ab_segment(
+                next_frame_b="approach_1", final_pose=approach_pose, spacing=0.1)
+        else:
+            # Robot is close - go directly to waypoint
+            track_builder.create_ab_segment(
+                next_frame_b="waypoint_1", final_pose=goal_pose, spacing=0.1)
 
         self.current_waypoint_index += 1
 
@@ -507,8 +555,37 @@ class MotionPlanner:
         track_builder = TrackBuilder(start=current_pose)
         track_builder.create_turn_segment(
             next_frame_b="aligned_to_goal", angle=turn_angle, spacing=0.05)
-        track_builder.create_ab_segment(
-            next_frame_b="waypoint_1", final_pose=goal_pose, spacing=0.1)
+
+        # Check distance to determine if we should use approach offset
+        current_x = current_pose.a_from_b.translation[0]
+        current_y = current_pose.a_from_b.translation[1]
+        goal_x = goal_pose.a_from_b.translation[0]
+        goal_y = goal_pose.a_from_b.translation[1]
+        distance_to_waypoint = hypot(goal_x - current_x, goal_y - current_y)
+
+        APPROACH_OFFSET = 1.5
+        if distance_to_waypoint > APPROACH_OFFSET + 0.5:  # Add 0.5m buffer
+            # Robot is far - use approach waypoint
+            approach_x, approach_y = _offset_towards(
+                (current_x, current_y),
+                (goal_x, goal_y),
+                APPROACH_OFFSET
+            )
+            approach_iso = Isometry3F64(
+                np.array([approach_x, approach_y, 0.0], dtype=np.float64),
+                goal_pose.a_from_b.rotation  # Use goal heading after turn
+            )
+            approach_pose = Pose3F64(
+                a_from_b=approach_iso,
+                frame_a="world",
+                frame_b="approach_1"
+            )
+            track_builder.create_ab_segment(
+                next_frame_b="approach_1", final_pose=approach_pose, spacing=0.1)
+        else:
+            # Robot is close - go directly to waypoint
+            track_builder.create_ab_segment(
+                next_frame_b="waypoint_1", final_pose=goal_pose, spacing=0.1)
 
         self.current_waypoint_index += 1
 
@@ -677,7 +754,26 @@ class MotionPlanner:
             track: Optional[Track] = None
             maneuver_type: FirstManeuver = await self._determine_first_maneuver()
             if maneuver_type == FirstManeuver.AB:
-                track = await self._create_ab_segment_to_next_waypoint()
+                # Check distance to determine if we should use approach offset
+                current_pose = await self._get_current_pose()
+                goal_pose = self.waypoints.get(1)
+                if goal_pose is not None:
+                    current_x = current_pose.a_from_b.translation[0]
+                    current_y = current_pose.a_from_b.translation[1]
+                    goal_x = goal_pose.a_from_b.translation[0]
+                    goal_y = goal_pose.a_from_b.translation[1]
+                    distance_to_waypoint = hypot(goal_x - current_x, goal_y - current_y)
+
+                    APPROACH_OFFSET = 1.5
+                    if distance_to_waypoint > APPROACH_OFFSET + 0.5:  # Add 0.5m buffer
+                        # Robot is far - use approach offset
+                        track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=APPROACH_OFFSET)
+                        seg_name = "approach_waypoint_0_to_1"
+                    else:
+                        # Robot is close - go directly
+                        track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=0.0)
+                else:
+                    track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=0.0)
             elif maneuver_type == FirstManeuver.REPOSITIONING:
                 logger.error("Robot is not behind goal. Reposition it first")
                 seg_name = None
@@ -708,7 +804,7 @@ class MotionPlanner:
                 distance_to_waypoint = hypot(target_x - current_x, target_y - current_y)
 
                 # Only use two-stage approach if robot is far enough away
-                APPROACH_OFFSET = 2.0
+                APPROACH_OFFSET = 1.5
                 if distance_to_waypoint > APPROACH_OFFSET + 0.5:  # Add 0.5m buffer
                     # Robot is far - use two-stage approach
                     track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=APPROACH_OFFSET)
@@ -746,7 +842,7 @@ class MotionPlanner:
                 distance_to_waypoint = hypot(target_x - current_x, target_y - current_y)
 
                 # Only use two-stage approach if robot is far enough away
-                APPROACH_OFFSET = 2.0
+                APPROACH_OFFSET = 1.5
                 if distance_to_waypoint > APPROACH_OFFSET + 0.5:  # Add 0.5m buffer
                     # Robot is far - use two-stage approach
                     track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=APPROACH_OFFSET)
