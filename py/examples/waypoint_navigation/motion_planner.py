@@ -34,6 +34,8 @@ from farm_ng_core_pybind import Pose3F64
 from farm_ng_core_pybind import Rotation3F64
 from google.protobuf.empty_pb2 import Empty
 from track_planner import TrackBuilder
+from utils.navigation_state import set_navigation_state
+from utils.pose_cache import set_latest_pose
 
 
 def _poses_from_csv(csv_path: Path) -> dict[int, Pose3F64]:
@@ -122,7 +124,16 @@ async def get_current_pose(client: EventClient | None = None, timeout: float = 5
             state: FilterState = await asyncio.wait_for(
                 client.request_reply("/get_state", Empty(), decode=True), timeout=timeout
             )
-            return Pose3F64.from_proto(state.pose)
+
+            # Update pose cache with filter state for Flask GUI
+            pose = Pose3F64.from_proto(state.pose)
+            x = float(pose.a_from_b.translation[0])
+            y = float(pose.a_from_b.translation[1])
+            yaw = float(pose.a_from_b.rotation.log()[-1])
+            converged = bool(getattr(state, "has_converged", False))
+            set_latest_pose(x, y, yaw, converged)
+
+            return pose
         except asyncio.TimeoutError:
             logger.info(
                 "Timeout while getting filter state. Using default start pose.")
@@ -187,6 +198,13 @@ class MotionPlanner:
         # Transform hole coordinates to robot coordinates
         self.waypoints = self._transform_holes_to_robot_poses(waypoints_dict.copy())
 
+        # Initialize navigation state for Flask GUI
+        set_navigation_state(
+            total_waypoints=len(self.waypoints),
+            current_waypoint_index=0,
+            navigation_running=True
+        )
+
         self.pose_query_task = asyncio.create_task(self._update_current_pose())
 
     def _load_tool_offset(self, tool_offsets_path: Path) -> Pose3F64:
@@ -249,6 +267,8 @@ class MotionPlanner:
                 logger.error(f"Error updating current pose: {e}")
                 return None
 
+            await asyncio.sleep(0.1)  # Poll at 10 Hz
+
     async def _get_current_pose(self) -> Pose3F64:
         """Get the current pose of the Amiga.
 
@@ -277,9 +297,6 @@ class MotionPlanner:
         """
         Replace the current target waypoint with a world pose at (X_w, Y_w). Heading defaults to current robot yaw.
         Returns the waypoint index that was modified.
-
-        Since _create_ab_segment_to_next_waypoint() increments current_waypoint_index BEFORE building the track,
-        current_waypoint_index already points to the waypoint we're currently navigating toward.
 
         NOTE: (X_w, Y_w) represents the HOLE/COLLAR position. This method applies the tool offset
         transformation to calculate where the robot center should be, just like CSV waypoint loading does.

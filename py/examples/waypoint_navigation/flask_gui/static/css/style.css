@@ -1,0 +1,336 @@
+/* Global Styles */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: #1a1a2e;
+    color: #eee;
+    overflow-x: hidden;
+}
+
+.container {
+    max-width: 1920px;
+    margin: 0 auto;
+    padding: 10px;
+}
+
+/* Header */
+header {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    padding: 20px;
+    border-radius: 10px;
+    margin-bottom: 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+}
+
+header h1 {
+    font-size: 28px;
+    font-weight: 600;
+}
+
+.status-badge {
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.status-badge.connected {
+    background: #10b981;
+    color: white;
+}
+
+.status-badge.disconnected {
+    background: #ef4444;
+    color: white;
+}
+
+/* Main Grid Layout */
+.main-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 1fr;
+    grid-template-rows: 1fr 1fr;
+    gap: 20px;
+    min-height: 80vh;
+}
+
+/* Span 2 rows for waypoint map and control panel */
+.plot-panel {
+    grid-row: span 2;
+}
+
+.control-panel {
+    grid-row: span 2;
+}
+
+.panel {
+    background: #16213e;
+    border-radius: 10px;
+    padding: 20px;
+    box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+}
+
+.panel h2 {
+    font-size: 18px;
+    margin-bottom: 15px;
+    color: #9d9dff;
+    border-bottom: 2px solid #667eea;
+    padding-bottom: 10px;
+}
+
+/* Waypoint Plot */
+.plot-panel {
+    display: flex;
+    flex-direction: column;
+}
+
+#plot-container {
+    flex: 1;
+    background: #0f1419;
+    border-radius: 8px;
+    padding: 10px;
+    min-height: 500px;
+}
+
+.plot-legend {
+    display: flex;
+    justify-content: space-around;
+    margin-top: 10px;
+    padding: 10px;
+    background: #0f1419;
+    border-radius: 5px;
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+}
+
+.legend-item .dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+}
+
+.dot.pending { background: #ef4444; }
+.dot.current { background: #3b82f6; border: 2px solid white; }
+.dot.completed { background: #10b981; }
+.dot.robot { background: #f59e0b; }
+.dot.detection { background: #a855f7; }
+
+/* Camera Feed Panel */
+.camera-panel {
+    display: flex;
+    flex-direction: column;
+}
+
+/* Detection Plot Panel */
+.detection-panel {
+    display: flex;
+    flex-direction: column;
+}
+
+.video-container {
+    position: relative;
+    background: #000;
+    border-radius: 8px;
+    overflow: hidden;
+    aspect-ratio: 1 / 1; /* Square container for 640x640 feed */
+    width: 100%;
+    flex: 1; /* Fill available space in column */
+}
+
+#detection-plot-container {
+    background: #1a1a1a;
+    border-radius: 8px;
+    aspect-ratio: 1 / 1; /* Match camera feed square aspect ratio */
+    width: 100%;
+    flex: 1; /* Fill available space in column */
+}
+
+#camera-feed {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+#camera-overlay {
+    position: absolute;
+    top: 10px;
+    left: 10px;
+    pointer-events: none;
+    display: none; /* Hidden by default, shown on error */
+}
+
+.camera-info {
+    background: rgba(0,0,0,0.7);
+    padding: 5px 10px;
+    border-radius: 5px;
+    font-size: 12px;
+    color: #10b981;
+}
+
+/* Status & Controls */
+.control-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+}
+
+.status-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 10px;
+}
+
+.status-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px;
+    background: #0f1419;
+    border-radius: 5px;
+}
+
+.status-item label {
+    font-weight: 600;
+    color: #9d9dff;
+    font-size: 14px;
+}
+
+.status-item span {
+    font-family: 'Courier New', monospace;
+    color: #fff;
+    font-size: 14px;
+}
+
+.badge {
+    padding: 4px 12px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 600;
+    background: #374151;
+}
+
+/* Controls */
+.controls {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.btn {
+    padding: 14px 20px;
+    border: none;
+    border-radius: 8px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+}
+
+.btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0,0,0,0.3);
+}
+
+.btn:active {
+    transform: translateY(0);
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+}
+
+.btn-success {
+    background: linear-gradient(135deg, #10b981 0%, #059669 100%);
+    color: white;
+}
+
+.btn-warning {
+    background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+    color: white;
+}
+
+.btn-danger {
+    background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+    color: white;
+    font-size: 18px;
+}
+
+.btn-danger:hover {
+    background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
+}
+
+/* Log Container */
+.log-container {
+    background: #0f1419;
+    border-radius: 5px;
+    padding: 10px;
+    height: 200px;
+    overflow-y: auto;
+    font-family: 'Courier New', monospace;
+    font-size: 12px;
+    color: #9ca3af;
+}
+
+.log-entry {
+    padding: 5px;
+    border-bottom: 1px solid #1f2937;
+}
+
+.log-entry:last-child {
+    border-bottom: none;
+}
+
+.log-entry.success { color: #10b981; }
+.log-entry.error { color: #ef4444; }
+.log-entry.warning { color: #f59e0b; }
+.log-entry.info { color: #3b82f6; }
+
+/* Scrollbar Styling */
+.log-container::-webkit-scrollbar {
+    width: 8px;
+}
+
+.log-container::-webkit-scrollbar-track {
+    background: #0f1419;
+}
+
+.log-container::-webkit-scrollbar-thumb {
+    background: #374151;
+    border-radius: 4px;
+}
+
+.log-container::-webkit-scrollbar-thumb:hover {
+    background: #4b5563;
+}
+
+/* Responsive Design */
+@media (max-width: 1400px) {
+    .main-grid {
+        grid-template-columns: 1fr 1fr;
+    }
+
+    .control-panel {
+        grid-column: 1 / -1;
+    }
+}
+
+@media (max-width: 768px) {
+    .main-grid {
+        grid-template-columns: 1fr;
+    }
+}

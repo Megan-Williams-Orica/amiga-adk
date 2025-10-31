@@ -1,10 +1,20 @@
 #!/usr/bin/env python3
 # detectionPlot.py — Host-side YOLOE detection with spatial coordinates
 
-import cv2, time, math, sys
+import cv2, time, math, sys, os
 import depthai as dai
 import numpy as np
+
+# Check if headless mode is enabled (for Flask integration) - MUST be before matplotlib imports
+HEADLESS_MODE = os.getenv('DETECTION_HEADLESS', '0') == '0'
+
 import matplotlib
+if HEADLESS_MODE:
+    matplotlib.use('Agg')  # Non-interactive backend
+    print("Running in headless mode (no matplotlib window)")
+else:
+    print("Running with matplotlib display")
+
 import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -25,6 +35,7 @@ except ImportError:
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 from utils.pose_cache import get_latest_pose, set_latest_pose
+from utils.camera_frame_cache import set_latest_frame
 
 
 # ---------------- Model / rates ----------------
@@ -225,7 +236,7 @@ def add_spatial_to_detections(detections: List[dict], depth_frame: np.ndarray,
             geometric_available = False
     else:
         geometric_available = False
-        print("[GEOM] Geometric correction disabled by parameter")
+        # print("[GEOM] Geometric correction disabled by parameter")
 
     for det in detections:
         # Use center of bounding box
@@ -788,8 +799,10 @@ print(f"   fx: {intrinsics['fx']:.2f}, fy: {intrinsics['fy']:.2f}")
 print(f"   cx: {intrinsics['cx']:.2f}, cy: {intrinsics['cy']:.2f}")
 
 # Visualizer
-vis = SpatialVisualizer(N_UP_CAM)
-vis.labelMap = list(detector.class_names.values())
+# Only create visualizer if not in headless mode
+vis = SpatialVisualizer(N_UP_CAM) if not HEADLESS_MODE else None
+if vis is not None:
+    vis.labelMap = list(detector.class_names.values())
 
 # Transforms
 xfm = Transforms(Path(os.environ.get("CAMERA_OFFSET_CONFIG", "camera_offset_config.json")))
@@ -831,7 +844,7 @@ with pipeline:
                 # Count every camera frame received
                 frame_count += 1
                 elapsed = time.time() - fps_start_time
-                if elapsed > 0:
+                if elapsed > 0 and vis is not None:
                     vis._current_fps = frame_count / elapsed
 
             if latestRgb is None or latestDepth is None:
@@ -872,13 +885,70 @@ with pipeline:
                 cv2.putText(display_frame, label, (x1, y1-10),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
-            # Update matplotlib figure with both views
+            # Share frame with Flask GUI
+            set_latest_frame(display_frame)
+
+            # Export detection data for Flask scatter plot
+            detection_data = []
+            for det in spatial_detections:
+                p_cam = np.array([
+                    det.spatialCoordinates.x,
+                    det.spatialCoordinates.y,
+                    det.spatialCoordinates.z
+                ]) / 1000.0
+
+                robot_pose = xfm.robot_pose_from_cam_point(p_cam)
+                v_r = np.array(robot_pose.a_from_b.translation)
+
+                detection_data.append({
+                    'x': float(v_r[0]),  # Forward
+                    'y': float(v_r[1]),  # Left/Right
+                    'z': float(v_r[2]),  # Up/Down
+                    'label': det.label_name,
+                    'confidence': float(det.confidence),
+                    'distance': float(np.linalg.norm(v_r))
+                })
+
+            # Write to shared file for Flask
             try:
-                vis.update_image(display_frame)  # Add camera view
-                vis.update_plot(spatial_detections)   # Update scatter plot
+                with open('/tmp/amiga_detections.json', 'w') as f:
+                    json.dump(detection_data, f)
             except Exception:
-                # Matplotlib window was closed, exit gracefully
-                break
+                pass
+
+            # ALWAYS emit closest detection (regardless of headless mode)
+            # Find closest detection and send UDP message
+            closest_detection = None
+            closest_distance = float('inf')
+            for det in spatial_detections:
+                p_cam = np.array([
+                    det.spatialCoordinates.x,
+                    det.spatialCoordinates.y,
+                    det.spatialCoordinates.z
+                ]) / 1000.0
+
+                robot_pose = xfm.robot_pose_from_cam_point(p_cam)
+                v_r = np.array(robot_pose.a_from_b.translation)
+                x_fwd, y_left = v_r[0], v_r[1]
+
+                distance = math.hypot(x_fwd, y_left)
+                if distance < closest_distance:
+                    closest_distance = distance
+                    closest_detection = (x_fwd, y_left, det.confidence, det.label)
+
+            # Emit the closest detection
+            if closest_detection is not None:
+                x_fwd, y_left, conf, label = closest_detection
+                maybe_emit_cone_goal(x_fwd, y_left, conf, label, list(detector.class_names.values()))
+
+            # Update matplotlib figure with both views (skip in headless mode)
+            if vis is not None:
+                try:
+                    vis.update_image(display_frame)  # Add camera view
+                    vis.update_plot(spatial_detections)   # Update scatter plot
+                except Exception:
+                    # Matplotlib window was closed, exit gracefully
+                    break
 
             # FPS counter
             if frame_count % 30 == 0:
@@ -889,13 +959,19 @@ with pipeline:
             # Check for quit key or if matplotlib window is closed
             if cv2.waitKey(1) == ord('q'):
                 break
-            if not plt.fignum_exists(vis.fig.number):
+            if vis is not None and not plt.fignum_exists(vis.fig.number):
                 break
 
     except KeyboardInterrupt:
-        print("\nInterrupted by user")
+        print("\nInterrupted by user (Ctrl+C)")
     finally:
         cv2.destroyAllWindows()
         plt.ioff()
-        if plt.fignum_exists(vis.fig.number):
-            plt.close(vis.fig)
+        # Only close figure if vis exists and has a figure
+        if vis is not None and hasattr(vis, 'fig') and vis.fig is not None:
+            try:
+                if plt.fignum_exists(vis.fig.number):
+                    plt.close(vis.fig)
+            except Exception:
+                pass  # Ignore cleanup errors
+        print("\nDetection script exited cleanly")

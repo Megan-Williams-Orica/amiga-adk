@@ -16,6 +16,7 @@ from farm_ng.track.track_pb2 import (
 from google.protobuf.empty_pb2 import Empty
 from utils.actuator import BaseActuator, NullActuator
 from utils.canbus import trigger_dipbob
+from utils.navigation_state import set_navigation_state
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +224,8 @@ class NavigationManager:
             try:
                 status_name = TrackStatusEnum.Name(track_status)
                 logger.info(f"Track status changed: {status_name}")
+                # Update Flask GUI state
+                set_navigation_state(track_status=status_name)
             except Exception as e:
                 logger.error(f"ERROR: getting status name: {e}")
 
@@ -472,6 +475,18 @@ class NavigationManager:
                     finally:
                         # Clear flag when deployment is complete
                         self.actuator_deploying = False
+
+                # Update Flask GUI state AFTER deployment completes (if this was a waypoint segment)
+                # NOTE: The waypoint index was already incremented in motion_planner when the track was created
+                # We just need to update the GUI to reflect the completed waypoint
+                if do_post_actions:
+                    # motion_planner.current_waypoint_index is now pointing to the NEXT target
+                    # So the waypoint we just completed is current_waypoint_index - 1
+                    from utils.navigation_state import mark_waypoint_complete
+                    completed_wp_idx = self.motion_planner.current_waypoint_index - 1
+                    mark_waypoint_complete(completed_wp_idx)
+                    set_navigation_state(current_waypoint_index=self.motion_planner.current_waypoint_index)
+                    logger.info(f"[GUI] Updated Flask state: completed waypoint {completed_wp_idx}, now targeting {self.motion_planner.current_waypoint_index}/{len(self.motion_planner.waypoints)}")
             else:
                 logger.warning("ERROR: Track segment failed or timed out")
 
