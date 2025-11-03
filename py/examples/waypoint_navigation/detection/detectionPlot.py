@@ -37,6 +37,9 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 from utils.pose_cache import get_latest_pose, set_latest_pose
 from utils.camera_frame_cache import set_latest_frame
 
+# IMU-based tilt compensation
+from imu_tilt_compensation import IMUTiltCompensation
+
 
 # ---------------- Model / rates ----------------
 # MODEL_PATH = Path(__file__).parent / "collarDetectionV2.engine"
@@ -47,7 +50,7 @@ CONF_THRESHOLD = 0.3
 IOU_THRESHOLD = 0.5
 IMG_SIZE = 640
 
-FPS = 15
+FPS = 30
 
 # ---------------- Camera / FOV ----------------
 USE_RGB_FOV     = True
@@ -55,10 +58,19 @@ RGB_HFOV_DEG    = 95     # per your spec
 RGB_VFOV_DEG    = 72     # vertical FOV used in projector/overlays
 STEREO_HFOV_DEG = 127    # keep if you ever switch to stereo FOV overlays
 
-# ---- Fixed camera tilt & height (no IMU) ----
+# ---- Camera tilt & height (with IMU compensation) ----
 CAM_HEIGHT_M = 0.880
-TILT_DEG     = 30.0      # +30° pitch DOWN
+TILT_DEG     = 30.0      # +30° pitch DOWN (nominal, when robot is level)
 theta = math.radians(TILT_DEG)
+
+# Initialize IMU tilt compensation
+# NOTE: Set ENABLE_IMU_COMPENSATION = False if IMU readings are incorrect
+ENABLE_IMU_COMPENSATION = True  # Enabled after calibration
+imu_compensator = IMUTiltCompensation(nominal_pitch_deg=TILT_DEG, nominal_roll_deg=0.0)
+
+# IMU calibration baseline (calibrated on level ground)
+IMU_BASELINE_PITCH = -64.8  # Stable reading on level ground
+IMU_BASELINE_ROLL = -0.9    # Stable reading on level ground
 
 # Cone/Hole goal
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -67,8 +79,13 @@ _last = (0.0, 0.0, 0.0)
 
 # Camera frame: +X right, +Y down, +Z forward. Level camera => up = [0, -1, 0].
 # With forward tilt, up tilts toward +Z: [0, -cos(theta), -sin(theta)].
+# NOTE: N_UP_CAM will be updated dynamically from IMU data in the main loop
 N_UP_CAM = np.array([0.0, -math.cos(theta), -math.sin(theta)], dtype=float)
 N_UP_CAM /= (np.linalg.norm(N_UP_CAM) + 1e-9)
+
+def get_current_up_vector():
+    """Get current up vector from IMU compensator or default."""
+    return imu_compensator.get_up_vector_camera_frame()
 
 # ---------------- Plot & display config ----------------
 KEEP_HISTORY   = False
@@ -428,30 +445,98 @@ def gnd_to_nadir(p_cam_m, n_up_cam, cam_height_m):
     gnd_dist = math.hypot(d_fwd, d_left)
     return gnd_dist, d_fwd, d_left
 
+class DetectionAverager:
+    """Rolling average filter for detection positions to reduce noise."""
+    def __init__(self, window_size=5, max_age_seconds=1.0):
+        self.window_size = window_size
+        self.max_age_seconds = max_age_seconds
+        self.detections = []  # List of (x_fwd, y_left, conf, timestamp)
+
+    def add_detection(self, x_fwd, y_left, conf):
+        """Add a new detection to the rolling window."""
+        now = time.time()
+        self.detections.append((x_fwd, y_left, conf, now))
+
+        # Remove old detections beyond time window
+        self.detections = [d for d in self.detections if (now - d[3]) < self.max_age_seconds]
+
+        # Keep only most recent N detections
+        if len(self.detections) > self.window_size:
+            self.detections = self.detections[-self.window_size:]
+
+    def get_averaged_position(self):
+        """Get averaged position, or None if insufficient data."""
+        if len(self.detections) < 3:  # Need at least 3 samples
+            return None
+
+        # Weight by confidence and recency
+        total_weight = 0.0
+        weighted_x = 0.0
+        weighted_y = 0.0
+        now = time.time()
+
+        for x, y, conf, timestamp in self.detections:
+            # Recency weight: newer detections weighted higher (exponential decay)
+            age = now - timestamp
+            recency_weight = math.exp(-age / 0.5)  # 0.5s time constant
+
+            # Combined weight
+            weight = conf * recency_weight
+            total_weight += weight
+            weighted_x += x * weight
+            weighted_y += y * weight
+
+        if total_weight < 0.01:
+            return None
+
+        avg_x = weighted_x / total_weight
+        avg_y = weighted_y / total_weight
+        avg_conf = sum(d[2] for d in self.detections) / len(self.detections)
+
+        return avg_x, avg_y, avg_conf
+
+    def clear(self):
+        """Clear all detections."""
+        self.detections = []
+
+# Global detection averager
+detection_averager = DetectionAverager(window_size=5, max_age_seconds=1.0)
+
 def maybe_emit_cone_goal(x_fwd, y_left, conf, label_id, label_map, r_max=10.0, min_period=0.8):
     global _last  # <-- important
-    r = math.hypot(x_fwd, y_left)
+
+    # Add detection to rolling average
+    detection_averager.add_detection(x_fwd, y_left, conf)
+
+    # Get averaged position
+    averaged = detection_averager.get_averaged_position()
+    if averaged is None:
+        return  # Not enough samples yet
+
+    avg_x, avg_y, avg_conf = averaged
+
+    r = math.hypot(avg_x, avg_y)
     now = time.time()
-    # print("Sending goal")
+
+    # Emit averaged position (not instantaneous)
     if r <= r_max and (now - _last[2]) >= min_period:
         try:
             class_name = label_map[label_id]
         except Exception:
             class_name = str(label_id)
         msg = {
-            "class_name": class_name,           # include the label id here
-            "class_id": int(label_id),          # explicit numeric id
-            "x_fwd_m": float(x_fwd),
-            "y_left_m": float(y_left),
-            "confidence": float(conf),
+            "class_name": class_name,
+            "class_id": int(label_id),
+            "x_fwd_m": float(avg_x),      # Averaged!
+            "y_left_m": float(avg_y),     # Averaged!
+            "confidence": float(avg_conf),
             "stamp": now,
-        } 
+        }
         print(msg)
         try:
             sock.sendto(json.dumps(msg).encode("utf-8"), GOAL_ADDR)
-            _last = (x_fwd, y_left, now)
+            _last = (avg_x, avg_y, now)
         except Exception as e:
-            # don’t crash the loop if UDP send fails
             print(f"[vision] UDP send failed: {e}")
 
 def robot_to_world(xr: float, yr: float, yaw: float, dx: float, dy: float):
@@ -704,9 +789,30 @@ class Transforms:
         # Net camera->robot rotation
         R_cam_to_robot = R_align * R_mount_cam
 
-        # Pose: robot_from_camera
+        # Store components for dynamic IMU updates
+        self.tx, self.ty, self.tz = tx, ty, tz
+        self.R_align = R_align
+        self.nominal_pitch_deg = pitch_deg
+
+        # Pose: robot_from_camera (will be updated dynamically with IMU)
         self.robot_from_camera = Pose3F64(
             a_from_b=Isometry3F64([tx, ty, tz], R_cam_to_robot),
+            frame_a="robot",
+            frame_b="camera",
+        )
+
+    def update_with_imu(self, effective_pitch_deg: float, effective_roll_deg: float):
+        """Update camera-to-robot transform with IMU-compensated tilt angles."""
+        # Mount correction in CAMERA frame with IMU compensation
+        R_mount_cam = (Rotation3F64.Rx(math.radians(-effective_pitch_deg)) *
+                       Rotation3F64.Rz(math.radians(-effective_roll_deg)))
+
+        # Net camera->robot rotation
+        R_cam_to_robot = self.R_align * R_mount_cam
+
+        # Update pose
+        self.robot_from_camera = Pose3F64(
+            a_from_b=Isometry3F64([self.tx, self.ty, self.tz], R_cam_to_robot),
             frame_a="robot",
             frame_b="camera",
         )
@@ -726,7 +832,7 @@ class Transforms:
 
 # ---------------- Build pipeline (host-side detection) ----------------
 def create_pipeline():
-    """Create OAK-D pipeline that streams RGB + Depth to host."""
+    """Create OAK-D pipeline that streams RGB + Depth + IMU to host."""
     if TARGET_DEVICE:
         device = dai.Device(TARGET_DEVICE)
         pipeline = dai.Pipeline(device)
@@ -755,11 +861,20 @@ def create_pipeline():
     # Depth output
     xoutDepth = stereo.depth
 
-    # Create output queues
+    # IMU node (for tilt compensation) - DepthAI v3 API
+    imu = pipeline.create(dai.node.IMU)
+
+    # Enable ROTATION_VECTOR sensor at 100 Hz (provides orientation quaternion)
+    imu.enableIMUSensor(dai.IMUSensor.ROTATION_VECTOR, 100)
+    imu.setBatchReportThreshold(1)
+    imu.setMaxBatchReports(10)
+
+    # Create output queues (matching v3 pattern used for RGB/Depth)
     qRgb = xoutRgb.createOutputQueue(maxSize=1, blocking=False)
     qDepth = xoutDepth.createOutputQueue(maxSize=1, blocking=False)
+    qImu = imu.out.createOutputQueue(maxSize=50, blocking=False)
 
-    return pipeline, qRgb, qDepth, device
+    return pipeline, qRgb, qDepth, qImu, device
 
 
 # Load YOLO model
@@ -778,11 +893,26 @@ detector = HostYOLODetector(MODEL_PATH, conf=CONF_THRESHOLD, iou=IOU_THRESHOLD)
 print(f"✓ Loaded YOLO model with {len(detector.class_names)} classes")
 
 # Create pipeline
-pipeline, qRgb, qDepth, device = create_pipeline()
+pipeline, qRgb, qDepth, qImu, device = create_pipeline()
 
 # Get camera intrinsics
 if device is None:
     device = pipeline.getDefaultDevice()
+
+# Check IMU type
+imuType = device.getConnectedIMU()
+print(f"\n📡 IMU type: {imuType}")
+if imuType == "BNO086":
+    if ENABLE_IMU_COMPENSATION:
+        print("✓ IMU tilt compensation ENABLED (pitch + roll)")
+        print(f"   Baseline calibration: pitch={IMU_BASELINE_PITCH:.1f}°, roll={IMU_BASELINE_ROLL:.1f}°")
+    else:
+        print("⚠️  IMU tilt compensation DISABLED")
+        print("   Using fixed 30° tilt (see ENABLE_IMU_COMPENSATION in code)")
+        print("   IMU readings will be logged but not applied")
+else:
+    print(f"⚠️  IMU type {imuType} detected - rotation vector may not be available")
+    print("   Using fixed tilt mode")
 
 calibData = device.readCalibration()
 intrinsics_matrix = calibData.getCameraIntrinsics(dai.CameraBoardSocket.CAM_A, IMG_SIZE, IMG_SIZE)
@@ -819,6 +949,12 @@ print("   Close matplotlib window to exit\n")
 
 pipeline.start()
 with pipeline:
+    # Initialize IMU logging variables (local to this scope)
+    last_calibrated_pitch = 0.0
+    last_calibrated_roll = 0.0
+    last_effective_pitch = TILT_DEG
+    last_effective_roll = 0.0
+
     latestDepth = None
     latestRgb   = None
 
@@ -831,6 +967,38 @@ with pipeline:
 
     try:
         while pipeline.isRunning():
+            # Update IMU data (tilt compensation)
+            imuData = drain_latest(qImu)
+            if imuData is not None:
+                imuPackets = imuData.packets
+                # Use the latest packet in this batch
+                if len(imuPackets) > 0:
+                    rVvalues = imuPackets[-1].rotationVector
+                    # Update compensator with quaternion (up vector updated internally)
+                    imu_compensator.update_from_quaternion(
+                        rVvalues.i, rVvalues.j, rVvalues.k, rVvalues.real
+                    )
+
+                    # Apply IMU compensation only if enabled
+                    if ENABLE_IMU_COMPENSATION:
+                        # Apply baseline calibration offset
+                        diag = imu_compensator.get_diagnostics()
+                        calibrated_pitch = diag['imu_pitch_deg'] - IMU_BASELINE_PITCH
+                        calibrated_roll = diag['imu_roll_deg'] - IMU_BASELINE_ROLL
+
+                        # Update effective angles with calibrated values
+                        effective_pitch = TILT_DEG - calibrated_pitch
+                        effective_roll = 0.0 - calibrated_roll
+
+                        # Update camera-to-robot transform with IMU-compensated angles
+                        xfm.update_with_imu(effective_pitch, effective_roll)
+
+                        # Store calibrated values for logging
+                        last_calibrated_pitch = calibrated_pitch
+                        last_calibrated_roll = calibrated_roll
+                        last_effective_pitch = effective_pitch
+                        last_effective_roll = effective_roll
+
             depthMsg = drain_latest(qDepth)
             if depthMsg is not None:
                 latestDepth = depthMsg.getFrame()
@@ -940,6 +1108,19 @@ with pipeline:
             if closest_detection is not None:
                 x_fwd, y_left, conf, label = closest_detection
                 maybe_emit_cone_goal(x_fwd, y_left, conf, label, list(detector.class_names.values()))
+
+                # Log IMU tilt compensation (every 10th detection to avoid spam)
+                if frame_count % 10 == 0:
+                    diag = imu_compensator.get_diagnostics()
+                    if abs(diag['imu_pitch_deg']) > 1.0 or abs(diag['imu_roll_deg']) > 1.0:
+                        if ENABLE_IMU_COMPENSATION:
+                            # Show calibrated values (what's actually being used)
+                            print(f"[IMU-APPLIED] raw: pitch={diag['imu_pitch_deg']:+.1f}° roll={diag['imu_roll_deg']:+.1f}° | "
+                                  f"calibrated Δ: pitch={last_calibrated_pitch:+.1f}° roll={last_calibrated_roll:+.1f}° → "
+                                  f"cam effective: {last_effective_pitch:.1f}°/{last_effective_roll:+.1f}°")
+                        else:
+                            print(f"[IMU-DISABLED] pitch: {diag['imu_pitch_deg']:+.1f}° roll: {diag['imu_roll_deg']:+.1f}° "
+                                  f"→ cam effective: {diag['effective_pitch_deg']:.1f}°/{diag['effective_roll_deg']:+.1f}°")
 
             # Update matplotlib figure with both views (skip in headless mode)
             if vis is not None:
