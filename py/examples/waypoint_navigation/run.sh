@@ -11,7 +11,7 @@ LOG_FILE="logs/navigation_$(date +%Y%m%d_%H%M%S).log"
 python main.py \
  --config ./configs/config.json \
  --tool-config-path ./configs/tool_config.json \
- --waypoints-path ./surveyed-waypoints/physicsLabBack2CESS.csv \
+ --waypoints-path ./surveyed-waypoints/physicsLabBack2Lanes.csv \
  --last-row-waypoint-index 3 \
  --turn-direction left \
  --row-spacing 2.8 \
