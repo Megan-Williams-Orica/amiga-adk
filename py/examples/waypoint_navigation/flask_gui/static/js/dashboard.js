@@ -71,13 +71,31 @@ function updateRobotStatus(status) {
     document.getElementById('waypoint').textContent =
         `${status.current_waypoint} / ${status.total_waypoints}`;
 
-    // Update track status
+    // Update track status with color coding
     const trackBadge = document.getElementById('track-status');
     trackBadge.textContent = status.track_status;
+    trackBadge.style.color = '#ffffff';  // White text
 
-    // Update filter convergence
+    // Color code based on status
+    if (status.track_status === 'TRACK_FINISHED') {
+        trackBadge.style.backgroundColor = '#BDDB94';  // Green for finished
+    } else if (status.track_status === 'ABORTED' || status.track_status === 'TRACK_ABORTED' || status.track_status === 'TRACK_FAILED') {
+        trackBadge.style.backgroundColor = '#ef4444';  // Red for aborted/failed
+    } else {
+        // IDLE, TRACK_FOLLOWING, or other states - match stop button (warning/orange)
+        trackBadge.style.background = 'linear-gradient(135deg, #BDDB94 100%, #d97706 100%)';
+    }
+
+    // Update filter convergence with color coding
     const filterBadge = document.getElementById('filter-converged');
     filterBadge.textContent = status.filter_converged ? 'YES' : 'NO';
+    if (status.filter_converged) {
+        filterBadge.style.color = '#ffffff';  // White text
+        filterBadge.style.backgroundColor = '#BDDB94';  // Green background for YES
+    } else {
+        filterBadge.style.color = '#ffffff';  // White text
+        filterBadge.style.backgroundColor = '#ef4444';  // Red background for NO
+    }
 
     // Update button states
     const btnStart = document.getElementById('btn-start');
@@ -154,11 +172,11 @@ function initializePlot() {
     svg.append('g')
         .attr('class', 'x-axis')
         .attr('transform', `translate(0,${plotHeight})`)
-        .style('color', '#9ca3af');
+        .style('color', '#0294D0');
 
     svg.append('g')
         .attr('class', 'y-axis')
-        .style('color', '#9ca3af');
+        .style('color', '#0294D0');
 
     // Add grid (horizontal lines)
     svg.append('g')
@@ -181,7 +199,7 @@ function initializePlot() {
         .attr('text-anchor', 'middle')
         .attr('x', plotWidth / 2)
         .attr('y', plotHeight + 35)
-        .style('fill', '#9ca3af')
+        .style('fill', '#0294D0')
         .text('X (meters)');
 
     svg.append('text')
@@ -190,7 +208,7 @@ function initializePlot() {
         .attr('transform', 'rotate(-90)')
         .attr('x', -plotHeight / 2)
         .attr('y', -45)
-        .style('fill', '#9ca3af')
+        .style('fill', '#0294D0')
         .text('Y (meters)');
 }
 
@@ -245,7 +263,7 @@ function updatePlot(data) {
         .attr('r', d => d.index === currentIndex ? 8 : 5)
         .attr('fill', d => {
             if (d.index === currentIndex) return '#3b82f6';
-            if (d.index < currentIndex) return '#10b981';
+            if (d.index < currentIndex) return '#BDDB94';
             return '#ef4444';
         })
         .attr('stroke', d => d.index === currentIndex ? 'white' : 'none')
@@ -266,7 +284,7 @@ function updatePlot(data) {
             // Robot body (circle)
             robotMarker.append('circle')
                 .attr('r', 10)
-                .attr('fill', '#f59e0b')
+                .attr('fill', '#FBB24B ')
                 .attr('stroke', 'white')
                 .attr('stroke-width', 2);
 
@@ -337,12 +355,12 @@ function initializeDetectionPlot() {
     detectionSvg.append('g')
         .attr('class', 'x-axis')
         .attr('transform', `translate(0,${detectionPlotHeight})`)
-        .style('color', '#9ca3af')
+        .style('color', '#0294D0')
         .call(d3.axisBottom(detectionXScale).ticks(5));
 
     detectionSvg.append('g')
         .attr('class', 'y-axis')
-        .style('color', '#9ca3af')
+        .style('color', '#0294D0')
         .call(d3.axisLeft(detectionYScale).ticks(5));
 
     // Add axis labels
@@ -350,7 +368,7 @@ function initializeDetectionPlot() {
         .attr('text-anchor', 'middle')
         .attr('x', detectionPlotWidth / 2)
         .attr('y', detectionPlotHeight + 35)
-        .style('fill', '#9ca3af')
+        .style('fill', '#0294D0')
         .text('Y (meters) [left +, right -]');
 
     detectionSvg.append('text')
@@ -358,7 +376,7 @@ function initializeDetectionPlot() {
         .attr('transform', 'rotate(-90)')
         .attr('x', -detectionPlotHeight / 2)
         .attr('y', -45)
-        .style('fill', '#9ca3af')
+        .style('fill', '#0294D0')
         .text('X (meters) [forward +]');
 
     // Draw FOV wedge (95° HFOV for RGB camera)
@@ -425,7 +443,7 @@ function drawFOVWedge() {
         .attr('y1', detectionYScale(0))
         .attr('x2', detectionXScale(rightY))
         .attr('y2', detectionYScale(MAX_RANGE_Y))
-        .attr('stroke', '#6b7280')
+        .attr('stroke', '#6b7280ff')
         .attr('stroke-dasharray', '4,2')
         .attr('stroke-width', 1);
 }
@@ -468,7 +486,7 @@ function drawRangeRings() {
                     .attr('x', detectionXScale(0.2))
                     .attr('y', detectionYScale(r * 0.98))
                     .attr('font-size', '10px')
-                    .attr('fill', '#9ca3af')
+                    .attr('fill', '#0294D0')
                     .text(`${r}m`);
             }
         }
@@ -489,7 +507,7 @@ function updateDetectionPlot(detections) {
         .attr('cx', d => detectionXScale(d.y))  // Y = left/right
         .attr('cy', d => detectionYScale(d.x))  // X = forward
         .attr('r', 6)
-        .attr('fill', '#a855f7')
+        .attr('fill', '#0294D0')
         .attr('stroke', 'white')
         .attr('stroke-width', 1)
         .style('cursor', 'pointer')

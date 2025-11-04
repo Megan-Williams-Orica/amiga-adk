@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Amiga Waypoint Navigation</title>
+    <title>X-STEM Waypoint Navigation</title>
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script src="https://d3js.org/d3.v7.min.js"></script>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
@@ -12,7 +12,7 @@
     <div class="container">
         <!-- Header -->
         <header>
-            <h1>🤖 Amiga Waypoint Navigation</h1>
+            <h1>X-STEM Waypoint Navigation</h1>
             <div id="connection-status" class="status-badge disconnected">Disconnected</div>
         </header>
 
@@ -41,7 +41,7 @@
                 </div>
             </div>
 
-            <!-- Column 3 Row 1: Detection Scatter Plot 1 -->
+            <!-- Column 3 Row 1: Detection Scatter Plot 1 and System Log -->
             <div class="panel detection-panel">
                 <h2>Detection Scatter Plot</h2>
                 <div id="detection-plot-container"></div>
@@ -88,16 +88,10 @@
                     <button id="btn-stop" class="btn btn-warning" onclick="stopNavigation()" disabled>
                         ⏸️ Stop Navigation
                     </button>
-                    <button id="btn-emergency" class="btn btn-danger" onclick="emergencyStop()">
-                        🛑 EMERGENCY STOP
-                    </button>
                 </div>
-
-                <h2>System Log</h2>
-                <div id="log-container" class="log-container"></div>
             </div>
 
-            <!-- Column 2 Row 2: Camera Feed 2 (Placeholder) -->
+            <!-- Column 1 Row 2: Camera Feed 2 (Placeholder) -->
             <div class="panel camera-panel">
                 <h2>Camera Feed 2</h2>
                 <div class="video-container" style="display: flex; align-items: center; justify-content: center; color: #666;">
@@ -105,12 +99,17 @@
                 </div>
             </div>
 
-            <!-- Column 3 Row 2: Detection Scatter Plot 2 (Placeholder) -->
+            <!-- Column 2 Row 2: Detection Scatter Plot 2 (Placeholder) -->
             <div class="panel detection-panel">
                 <h2>Detection Plot 2</h2>
                 <div id="detection-plot-container-2" style="display: flex; align-items: center; justify-content: center; color: #666;">
                     <span>Not Connected</span>
                 </div>
+            </div>
+            <!-- Column 3 Row 2: System Log -->
+            <div class="panel sys-log-panel">
+                <h2>System Log</h2>
+                <div id="log-container" class="log-container"></div>
             </div>
         </div>
     </div>
