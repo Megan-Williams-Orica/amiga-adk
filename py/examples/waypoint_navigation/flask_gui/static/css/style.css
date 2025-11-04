@@ -1,3 +1,7 @@
+/* Import Nexa Black Font and Frutiger */
+@import url('https://fonts.cdnfonts.com/css/nexa-bold');
+@import url('https://fonts.cdnfonts.com/css/frutiger');
+
 /* Global Styles */
 * {
     margin: 0;
@@ -6,9 +10,9 @@
 }
 
 body {
-    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    background: #1a1a2e;
-    color: #eee;
+    font-family: 'Frutiger LT Std 45 Light', 'Frutiger', 'Segoe UI', sans-serif;
+    background: #ffffff;
+    color: #333333;
     overflow-x: hidden;
 }
 
@@ -20,7 +24,7 @@ body {
 
 /* Header */
 header {
-    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    background: #0294D0;
     padding: 20px;
     border-radius: 10px;
     margin-bottom: 20px;
@@ -31,8 +35,10 @@ header {
 }
 
 header h1 {
+    font-family: 'Nexa Black', 'Nexa', sans-serif;
     font-size: 28px;
-    font-weight: 600;
+    font-weight: 900;
+    text-transform: uppercase;
 }
 
 .status-badge {
@@ -61,27 +67,26 @@ header h1 {
     min-height: 80vh;
 }
 
-/* Span 2 rows for waypoint map and control panel */
-.plot-panel {
-    grid-row: span 2;
-}
-
+/* Control panel spans 2 rows */
 .control-panel {
     grid-row: span 2;
 }
 
 .panel {
-    background: #16213e;
+    background: #002D64;
     border-radius: 10px;
     padding: 20px;
     box-shadow: 0 4px 6px rgba(0,0,0,0.3);
 }
 
 .panel h2 {
+    font-family: 'Nexa Black', 'Nexa', sans-serif;
     font-size: 18px;
+    font-weight: 900;
+    text-transform: uppercase;
     margin-bottom: 15px;
-    color: #9d9dff;
-    border-bottom: 2px solid #667eea;
+    color: #ffffff;
+    border-bottom: 2px solid #0294D0;
     padding-bottom: 10px;
 }
 
@@ -93,10 +98,11 @@ header h1 {
 
 #plot-container {
     flex: 1;
-    background: #0f1419;
+    background: #ffffff;
     border-radius: 8px;
     padding: 10px;
-    min-height: 500px;
+    aspect-ratio: 1 / 1; /* Match camera feed aspect ratio */
+    width: 100%;
 }
 
 .plot-legend {
@@ -104,7 +110,7 @@ header h1 {
     justify-content: space-around;
     margin-top: 10px;
     padding: 10px;
-    background: #0f1419;
+    background: #ffffff;
     border-radius: 5px;
 }
 
@@ -113,6 +119,7 @@ header h1 {
     align-items: center;
     gap: 8px;
     font-size: 12px;
+    color: #333333;
 }
 
 .legend-item .dot {
@@ -125,7 +132,7 @@ header h1 {
 .dot.current { background: #3b82f6; border: 2px solid white; }
 .dot.completed { background: #10b981; }
 .dot.robot { background: #f59e0b; }
-.dot.detection { background: #a855f7; }
+.dot.detection { background: #0294D0; }
 
 /* Camera Feed Panel */
 .camera-panel {
@@ -141,7 +148,7 @@ header h1 {
 
 .video-container {
     position: relative;
-    background: #000;
+    background: #000000;
     border-radius: 8px;
     overflow: hidden;
     aspect-ratio: 1 / 1; /* Square container for 640x640 feed */
@@ -150,7 +157,7 @@ header h1 {
 }
 
 #detection-plot-container {
-    background: #1a1a1a;
+    background: #ffffff;
     border-radius: 8px;
     aspect-ratio: 1 / 1; /* Match camera feed square aspect ratio */
     width: 100%;
@@ -197,19 +204,19 @@ header h1 {
     justify-content: space-between;
     align-items: center;
     padding: 10px;
-    background: #0f1419;
+    background: #ffffff;
     border-radius: 5px;
 }
 
 .status-item label {
     font-weight: 600;
-    color: #9d9dff;
+    color: #002D64;
     font-size: 14px;
 }
 
 .status-item span {
     font-family: 'Courier New', monospace;
-    color: #fff;
+    color: #333333;
     font-size: 14px;
 }
 
@@ -219,6 +226,7 @@ header h1 {
     font-size: 12px;
     font-weight: 600;
     background: #374151;
+    color: #ffffff;
 }
 
 /* Controls */
@@ -276,14 +284,14 @@ header h1 {
 
 /* Log Container */
 .log-container {
-    background: #0f1419;
+    background: #ffffff;
     border-radius: 5px;
     padding: 10px;
     height: 200px;
     overflow-y: auto;
     font-family: 'Courier New', monospace;
     font-size: 12px;
-    color: #9ca3af;
+    color: #333333;
 }
 
 .log-entry {
@@ -306,7 +314,7 @@ header h1 {
 }
 
 .log-container::-webkit-scrollbar-track {
-    background: #0f1419;
+    background: #ffffff;
 }
 
 .log-container::-webkit-scrollbar-thumb {
