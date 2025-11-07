@@ -14,8 +14,8 @@ python main.py \
  --waypoints-path ./surveyed-waypoints/physicsLabBack2Lanes.csv \
  --last-row-waypoint-index 3 \
  --turn-direction left \
- --row-spacing 2.8 \
+ --row-spacing 2.6 \
  --headland-buffer 2.0 \
- --actuator-enabled --actuator-id 0 --actuator-rate-hz 5.0 2>&1 | tee "$LOG_FILE"
+ --actuator-id 0 --actuator-rate-hz 5.0 2>&1 | tee "$LOG_FILE"
 
 echo "Log saved to: $LOG_FILE"

@@ -15,7 +15,7 @@ from farm_ng.track.track_pb2 import (
 )
 from google.protobuf.empty_pb2 import Empty
 from utils.actuator import BaseActuator, NullActuator
-from utils.canbus import trigger_dipbob
+from utils.canbus import trigger_dipbob, imu_wiggle
 from utils.navigation_state import set_navigation_state
 
 logger = logging.getLogger(__name__)
@@ -62,6 +62,7 @@ class NavigationManager:
         self.track_executing = False  # Track if robot is actively executing a track segment
         self.waiting_for_collar_detection = False  # Track if robot is stopped at approach position waiting for vision
         self._controller_lock = getattr(self, "_controller_lock", asyncio.Lock())
+        self.last_failure_modes: List[str] = []  # Store last detected failure modes
 
 
         # Actuator / CAN config
@@ -259,9 +260,12 @@ class NavigationManager:
 
                     logger.info(
                         f"Robot not controllable. Failure modes: {failure_modes}")
+                    # Store failure modes for later processing
+                    self.last_failure_modes = failure_modes
                 except Exception as e:
                     logger.error(
                         f"Robot not controllable. Failed to get failure modes: {e}")
+                    self.last_failure_modes = []
             self.track_failed_event.set()
 
         # Log cross-track error if available
@@ -417,87 +421,163 @@ class NavigationManager:
 
         return False
 
-    async def execute_single_track(self, track: Track, timeout: float = 30.0, *, do_post_actions: bool = True) -> bool:
-        """Execute a single track segment and wait for completion."""
-        self.track_complete_event.clear()
-        self.track_failed_event.clear()
+    async def execute_single_track(self, track: Track, timeout: float = 30.0, *, do_post_actions: bool = True, max_filter_retries: int = 3, max_canbus_retries: int = 2) -> bool:
+        """Execute a single track segment and wait for completion.
 
-        try:
-            # Set flag to prevent vision from overriding waypoints during execution
-            self.track_executing = True
+        If FILTER_DIVERGED is detected, will attempt to wiggle the robot and retry.
+        If CANBUS_TIMEOUT is detected, will wait and retry.
 
-            await self.set_track(track)
-            await asyncio.sleep(1.0)  # ensure track is set
-            # TODO: Add IMUjiggle function
-            await self.start_following()
+        Args:
+            track: Track segment to execute
+            timeout: Timeout in seconds for track completion
+            do_post_actions: Whether to perform actuator deployment after completion
+            max_filter_retries: Maximum number of wiggle retries on FILTER_DIVERGED (default: 3)
+            max_canbus_retries: Maximum number of retries on CANBUS_TIMEOUT (default: 2)
+        """
+        filter_retry_count = 0
+        canbus_retry_count = 0
 
-            success = await self.wait_for_track_completion(timeout)
+        while filter_retry_count <= max_filter_retries or canbus_retry_count <= max_canbus_retries:
+            self.track_complete_event.clear()
+            self.track_failed_event.clear()
+            self.last_failure_modes = []  # Clear previous failure modes
 
-            # Clear flag after track execution completes (before deployment)
-            self.track_executing = False
+            try:
+                # Set flag to prevent vision from overriding waypoints during execution
+                self.track_executing = True
 
-            if success:
-                logger.info("SUCCESS: Track segment completed")
-                if do_post_actions and self.actuator_enabled:
-                    # Set flag to disable vision during deployment
-                    self.actuator_deploying = True
+                await self.set_track(track)
+                await asyncio.sleep(1.0)  # ensure track is set
+                await self.start_following()
 
-                    try:
-                        # 1) wait briefly
-                        await asyncio.sleep(2.0)
+                success = await self.wait_for_track_completion(timeout)
 
-                        # 2) Deploy plumbob (tool already over hole)
-                        await trigger_dipbob("can0")
-                        logger.info("Deploying dipbob")
-                        await asyncio.sleep(3.0)  # TODO: swap for measurement await
+                # Check if failure was due to FILTER_DIVERGED
+                if not success and "FILTER_DIVERGED" in self.last_failure_modes:
+                    filter_retry_count += 1
 
-                        # 3) Move forward so robot origin is over the hole
-                        origin_track = await self.motion_planner.create_tool_to_origin_segment()
-                        ok2 = await self.execute_single_track(origin_track, timeout=15.0, do_post_actions=False)
-                        if not ok2:
-                            logger.warning("tool→origin micro-segment failed; skipping chute pulse")
-                            return success  # don't open chute if failed
+                    if filter_retry_count <= max_filter_retries:
+                        logger.warning(f"FILTER_DIVERGED detected. Attempting wiggle recovery (attempt {filter_retry_count}/{max_filter_retries})...")
 
-                        # 4) Open/close chute
-                        await self.actuator.pulse_sequence(
-                            open_seconds=self.actuator_open_seconds,
-                            close_seconds=self.actuator_close_seconds,
-                            rate_hz=self.actuator_rate_hz,
-                            settle_before=3.0,
-                            settle_between=0.0,
-                            wait_for_enter_between=False,
-                            enter_prompt="Hole measured. Press ENTER to close the chute...",
-                            enter_timeout=30.0,      # safety timeout
-                        )
+                        # Cancel current track
+                        await self._cancel_following()
 
-                        # Wait for CAN bus to settle after actuator deployment
-                        await asyncio.sleep(1.0)
-                    finally:
-                        # Clear flag when deployment is complete
-                        self.actuator_deploying = False
+                        # Perform wiggle if canbus client is available
+                        if self.canbus_client is not None:
+                            wiggle_success = await imu_wiggle(
+                                canbus_client=self.canbus_client,
+                                filter_client=self.filter_client,
+                                duration_seconds=3.0,
+                                angular_velocity=0.3,
+                                check_convergence=True,
+                                max_attempts=1  # One wiggle attempt per retry
+                            )
 
-                # Update Flask GUI state AFTER deployment completes (if this was a waypoint segment)
-                # NOTE: The waypoint index was already incremented in motion_planner when the track was created
-                # We just need to update the GUI to reflect the completed waypoint
-                if do_post_actions:
-                    # motion_planner.current_waypoint_index is now pointing to the NEXT target
-                    # So the waypoint we just completed is current_waypoint_index - 1
-                    from utils.navigation_state import mark_waypoint_complete
-                    completed_wp_idx = self.motion_planner.current_waypoint_index - 1
-                    mark_waypoint_complete(completed_wp_idx)
-                    set_navigation_state(current_waypoint_index=self.motion_planner.current_waypoint_index)
-                    logger.info(f"[GUI] Updated Flask state: completed waypoint {completed_wp_idx}, now targeting {self.motion_planner.current_waypoint_index}/{len(self.motion_planner.waypoints)}")
-            else:
-                logger.warning("ERROR: Track segment failed or timed out")
+                            if wiggle_success:
+                                logger.info("✓ Filter converged after wiggle. Retrying track segment...")
+                                continue  # Retry the track
+                            else:
+                                logger.warning("Filter still diverged after wiggle.")
+                        else:
+                            logger.warning("Cannot wiggle: no canbus client available")
+                    else:
+                        logger.error(f"Max filter retries ({max_filter_retries}) exceeded. Giving up on this segment.")
+                        return False
 
-            return success
+                # Check if failure was due to CANBUS_TIMEOUT
+                elif not success and "CANBUS_TIMEOUT" in self.last_failure_modes:
+                    canbus_retry_count += 1
 
-        except Exception as e:
-            logger.error(f"ERROR: executing track: {e}")
-            return False
-        finally:
-            # Ensure flag is cleared even if an exception occurs
-            self.track_executing = False
+                    if canbus_retry_count <= max_canbus_retries:
+                        # Wait for canbus service to recover before retrying
+                        recovery_delay = 3.0  # Give canbus service time to clear backlog
+                        logger.warning(f"CANBUS_TIMEOUT detected. Waiting {recovery_delay}s for service recovery (attempt {canbus_retry_count}/{max_canbus_retries})...")
+
+                        # Cancel current track
+                        await self._cancel_following()
+                        await asyncio.sleep(recovery_delay)
+
+                        logger.info("Retrying track segment after canbus recovery delay...")
+                        continue  # Retry the track
+                    else:
+                        logger.error(f"Max canbus retries ({max_canbus_retries}) exceeded. Giving up on this segment.")
+                        return False
+                else:
+                    # Success or non-filter/canbus failure - break out of retry loop
+                    break
+
+            except Exception as e:
+                logger.error(f"Exception during track execution: {e}")
+                self.track_executing = False
+                raise
+
+        success = not self.track_failed_event.is_set()
+
+        # Clear flag after track execution completes (before deployment)
+        self.track_executing = False
+
+        if success:
+            logger.info("SUCCESS: Track segment completed")
+
+            # Add recovery delay to allow CAN bus to settle before next segment
+            # This helps prevent CANBUS_TIMEOUT failures in track follower
+            recovery_delay = 0.5  # 500ms recovery time
+            logger.debug(f"CAN bus recovery delay: {recovery_delay}s")
+            await asyncio.sleep(recovery_delay)
+
+            if do_post_actions and self.actuator_enabled:
+                # Set flag to disable vision during deployment
+                self.actuator_deploying = True
+
+                try:
+                    # 1) wait briefly
+                    await asyncio.sleep(2.0)
+
+                    # 2) Deploy plumbob (tool already over hole)
+                    await trigger_dipbob("can0")
+                    logger.info("Deploying dipbob")
+                    await asyncio.sleep(3.0)  # TODO: swap for measurement await
+
+                    # 3) Move forward so robot origin is over the hole
+                    origin_track = await self.motion_planner.create_tool_to_origin_segment()
+                    ok2 = await self.execute_single_track(origin_track, timeout=15.0, do_post_actions=False)
+                    if not ok2:
+                        logger.warning("tool→origin micro-segment failed; skipping chute pulse")
+                        return success  # don't open chute if failed
+
+                    # 4) Open/close chute
+                    await self.actuator.pulse_sequence(
+                        open_seconds=self.actuator_open_seconds,
+                        close_seconds=self.actuator_close_seconds,
+                        rate_hz=self.actuator_rate_hz,
+                        settle_before=3.0,
+                        settle_between=0.0,
+                        wait_for_enter_between=False,
+                        enter_prompt="Hole measured. Press ENTER to close the chute...",
+                        enter_timeout=30.0,      # safety timeout
+                    )
+
+                    # Wait for CAN bus to settle after actuator deployment
+                    await asyncio.sleep(1.0)
+                finally:
+                    # Clear flag when deployment is complete
+                    self.actuator_deploying = False
+
+            # Update Flask GUI state AFTER deployment completes (if this was a waypoint segment)
+            # NOTE: The waypoint index was already incremented in motion_planner when the track was created
+            # We just need to update the GUI to reflect the completed waypoint
+            if do_post_actions:
+                # motion_planner.current_waypoint_index is now pointing to the NEXT target
+                # So the waypoint we just completed is current_waypoint_index - 1
+                from utils.navigation_state import mark_waypoint_complete
+                completed_wp_idx = self.motion_planner.current_waypoint_index - 1
+                mark_waypoint_complete(completed_wp_idx)
+                set_navigation_state(current_waypoint_index=self.motion_planner.current_waypoint_index)
+                logger.info(f"[GUI] Updated Flask state: completed waypoint {completed_wp_idx}, now targeting {self.motion_planner.current_waypoint_index}/{len(self.motion_planner.waypoints)}")
+        else:
+            logger.warning("ERROR: Track segment failed or timed out")
+
+        return success
 
     async def run_navigation(self) -> None:
         """Run the complete waypoint navigation sequence."""
@@ -639,6 +719,13 @@ class NavigationManager:
                     logger.warning(
                         f"Failed to execute segment {segment_count}. Stopping navigation.")
                     failed_attempts += 1
+
+                    # Add exponential backoff delay after failures to allow CAN bus recovery
+                    # This is especially important for CANBUS_TIMEOUT failures
+                    backoff_delay = min(2.0 ** failed_attempts, 10.0)  # Cap at 10 seconds
+                    logger.info(f"Waiting {backoff_delay:.1f}s before retry (attempt {failed_attempts})...")
+                    await asyncio.sleep(backoff_delay)
+
                     if segment_count == 1 and failed_attempts > 5:
                         # await move_robot_forward(time_goal=1.5) #TODO: implement
                         logger.info(

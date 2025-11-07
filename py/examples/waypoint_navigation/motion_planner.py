@@ -192,6 +192,10 @@ class MotionPlanner:
             raise ValueError("turn_direction must be either 'left' or 'right'")
         self.turn_angle_sign: float = 1.0 if turn_direction == "left" else -1.0
 
+        # Cached turn waypoints for consistent retry behavior
+        self._turn_waypoint_1: Optional[Pose3F64] = None
+        self._turn_waypoint_3: Optional[Pose3F64] = None
+
         if not isinstance(waypoints_path, Path):
             waypoints_path = Path(waypoints_path)
         try:
@@ -528,11 +532,11 @@ class MotionPlanner:
                 frame_b="approach_1"
             )
             track_builder.create_ab_segment(
-                next_frame_b="approach_1", final_pose=approach_pose, spacing=0.1)
+                next_frame_b="approach_1", final_pose=approach_pose, spacing=0.5)
         else:
             # Robot is close - go directly to waypoint
             track_builder.create_ab_segment(
-                next_frame_b="waypoint_1", final_pose=goal_pose, spacing=0.1)
+                next_frame_b="waypoint_1", final_pose=goal_pose, spacing=0.5)
 
         self.current_waypoint_index += 1
 
@@ -581,11 +585,11 @@ class MotionPlanner:
                 frame_b="approach_1"
             )
             track_builder.create_ab_segment(
-                next_frame_b="approach_1", final_pose=approach_pose, spacing=0.1)
+                next_frame_b="approach_1", final_pose=approach_pose, spacing=0.5)
         else:
             # Robot is close - go directly to waypoint
             track_builder.create_ab_segment(
-                next_frame_b="waypoint_1", final_pose=goal_pose, spacing=0.1)
+                next_frame_b="waypoint_1", final_pose=goal_pose, spacing=0.5)
 
         self.current_waypoint_index += 1
 
@@ -640,14 +644,14 @@ class MotionPlanner:
             track_builder.create_ab_segment(
                 next_frame_b=f"approach_{self.current_waypoint_index}",
                 final_pose=approach_pose,
-                spacing=0.1,
+                spacing=0.5,
             )
         else:
             # Standard behavior - go directly to waypoint
             track_builder.create_ab_segment(
                 next_frame_b=f"waypoint_{self.current_waypoint_index}",
                 final_pose=target_pose,
-                spacing=0.1,
+                spacing=0.5,
             )
 
         return track_builder.track
@@ -665,43 +669,120 @@ class MotionPlanner:
         track_builder.create_ab_segment(
             next_frame_b=f"waypoint_{self.current_waypoint_index}",
             final_pose=target_pose,
-            spacing=0.1,
+            spacing=0.5,
         )
         return track_builder.track
 
     async def _row_end_maneuver(self, index: int) -> Track:
         """Create a row end maneuver segment based on the index.
 
+        New approach: For straight segments (1 & 3), computes and caches target waypoint
+        on first attempt, then reuses it on retries. This prevents off-course behavior.
+
         Args:
-            index: The index of the row end maneuver (1 to 5)
+            index: The index of the row end maneuver (1 to 4)
+                1: Drive forward into headland buffer
+                2: Turn 90° in place
+                3: Drive across row spacing
+                4: Turn 90° in place
         Returns:
             The track segment for the row end maneuver (Track)
         """
         if index < 1 or index > 4:
             raise ValueError("index must be between 1 and 4")
 
-        # Create a turn segment based on the index
-        current_pose = await self._get_current_pose()
-        track_builder = TrackBuilder(start=current_pose)
         track_segment: Track
         next_frame_b = f"row_end_{index}"
+
         if index == 1:
-            # Drive forward – move away from the last hole into a buffer zone.
+            # Segment 1: Drive forward into headland buffer
+            # Cache target waypoint on first attempt, reuse on retry
+            if not hasattr(self, '_turn_waypoint_1') or self._turn_waypoint_1 is None:
+                current_pose = await self._get_current_pose()
+                self._turn_waypoint_1 = self._compute_waypoint_ahead(
+                    current_pose, distance=self.headland_buffer
+                )
+                logger.info(f"[TURN] Created virtual waypoint 1 at {self.headland_buffer}m ahead")
+
+            # Build track from current position to cached waypoint
+            current_pose = await self._get_current_pose()
+            track_builder = TrackBuilder(start=current_pose)
             track_builder.create_straight_segment(
-                next_frame_b=next_frame_b, distance=self.headland_buffer, spacing=0.1)
+                next_frame_b=next_frame_b,
+                distance=self.headland_buffer,
+                spacing=0.5
+            )
             track_segment = track_builder.track
+
         elif index == 2 or index == 4:
-            # Turn 90° – reorient the robot toward the next row.
+            # Segment 2 & 4: Turn 90° in place
+            # Turns always regenerate from current pose (no fixed target)
+            current_pose = await self._get_current_pose()
+            track_builder = TrackBuilder(start=current_pose)
             track_builder.create_turn_segment(
-                next_frame_b=next_frame_b, angle=radians(90 * self.turn_angle_sign))
+                next_frame_b=next_frame_b,
+                angle=radians(90 * self.turn_angle_sign),
+                spacing=0.15  # Increased from 0.1 to reduce waypoint density (fewer CAN messages)
+            )
             track_segment = track_builder.track
-        else:
-            # Drive forward – cross the row spacing gap.
+
+        else:  # index == 3
+            # Segment 3: Drive across row spacing
+            # Cache target waypoint on first attempt, reuse on retry
+            if not hasattr(self, '_turn_waypoint_3') or self._turn_waypoint_3 is None:
+                current_pose = await self._get_current_pose()
+                self._turn_waypoint_3 = self._compute_waypoint_ahead(
+                    current_pose, distance=self.row_spacing
+                )
+                logger.info(f"[TURN] Created virtual waypoint 3 at {self.row_spacing}m ahead")
+
+            # Build track from current position to cached waypoint
+            current_pose = await self._get_current_pose()
+            track_builder = TrackBuilder(start=current_pose)
             track_builder.create_straight_segment(
-                next_frame_b=next_frame_b, distance=self.row_spacing, spacing=0.1)
+                next_frame_b=next_frame_b,
+                distance=self.row_spacing,
+                spacing=0.5
+            )
             track_segment = track_builder.track
 
         return track_segment
+
+    def _compute_waypoint_ahead(self, current_pose: Pose3F64, distance: float) -> Pose3F64:
+        """Compute a virtual waypoint at specified distance ahead of current pose.
+
+        Args:
+            current_pose: Current robot pose
+            distance: Distance ahead to place waypoint (meters)
+
+        Returns:
+            Virtual waypoint pose at specified distance ahead
+        """
+        # Get current heading from pose
+        current_iso = current_pose.a_from_b
+
+        # Create forward translation in robot frame
+        forward_offset = Isometry3F64(
+            translation=[distance, 0, 0],  # Forward is +X in robot frame
+            rotation=Rotation3F64()  # No rotation
+        )
+
+        # Compute target pose: current_pose * forward_offset
+        target_iso = current_iso * forward_offset
+
+        # Create target waypoint with same frame names
+        target_waypoint = Pose3F64(
+            a_from_b=target_iso,
+            frame_a=current_pose.frame_a,
+            frame_b=f"{current_pose.frame_b}_virtual"
+        )
+
+        return target_waypoint
+
+    def _clear_turn_waypoints(self):
+        """Clear cached turn waypoints when starting new turn sequence."""
+        self._turn_waypoint_1 = None
+        self._turn_waypoint_3 = None
 
     async def _shutdown(self):
         """Shutdown the motion planner."""
@@ -828,6 +909,8 @@ class MotionPlanner:
         if self.row_end_segment_index >= 5:
             logger.info(
                 "Finished all row end maneuvers, moving to the next row.")
+            # Clear cached turn waypoints for next turn sequence
+            self._clear_turn_waypoints()
             curr_index = self.current_waypoint_index
 
             # Check if robot is already close to the first waypoint of next row

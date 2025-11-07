@@ -151,7 +151,7 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
     MIN_DIST_DELTA = 0.35
     MIN_PERIOD_S   = 0.8
 
-    print("Started vision goal listener")
+    # print("Started vision goal listener")
 
     try:
         while True:
@@ -265,14 +265,14 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
 
             # ---- Check if actuator is deploying ----
             if getattr(nav_manager, "actuator_deploying", False):
-                print("[VISION] skip: actuator is deploying")
+                # print("[VISION] skip: actuator is deploying")
                 continue
 
             # ---- Check if we've already processed this waypoint ----
             # target_wp_idx was already calculated by cone_distance_from_csv_waypoint() above
             # and represents the CSV waypoint we're checking against
             if target_wp_idx in nav_manager.vision_completed_waypoints:
-                print(f"[VISION] skip: waypoint {target_wp_idx} already processed by vision")
+                # print(f"[VISION] skip: waypoint {target_wp_idx} already processed by vision")
                 continue
 
             # ---- debounce ----
@@ -280,7 +280,7 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             if last_goal is not None:
                 moved = math.hypot(x - last_goal[0], y - last_goal[1])
                 if moved < MIN_DIST_DELTA and (now - last_sent_t) < MIN_PERIOD_S:
-                    print(f"[VISION] skip: debounce (moved={moved:.2f}, dt={now-last_sent_t:.2f})")
+                    # print(f"[VISION] skip: debounce (moved={moved:.2f}, dt={now-last_sent_t:.2f})")
                     continue
 
             # ---- Check if robot is waiting at approach position for collar detection ----
@@ -294,7 +294,7 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
             try:
                 # Override the next waypoint position with the detected cone position
                 modified_idx = await motion_planner.override_next_waypoint_world_xy(X_obj, Y_obj, yaw_rad=None)
-                print(f"[VISION] Overrode waypoint {modified_idx} position to cone at ({X_obj:.2f}, {Y_obj:.2f})")
+                # print(f"[VISION] Overrode waypoint {modified_idx} position to cone at ({X_obj:.2f}, {Y_obj:.2f})")
 
                 # Mark that we detected a valid cone for the current waypoint
                 nav_manager.cone_detected_for_current_wp = True

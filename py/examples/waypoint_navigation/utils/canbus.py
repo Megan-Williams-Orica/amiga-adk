@@ -110,20 +110,20 @@ async def imu_wiggle(
     Returns:
         True if filter converged (or if not checking), False if still diverged after max attempts
     """
-    logger.info("Starting IMU wiggle to help filter converge...")
+    # logger.info("Starting IMU wiggle to help filter converge...")
 
     # Check initial convergence state
     initial_converged = False
     if filter_client and check_convergence:
         initial_converged = await check_filter_convergence(filter_client)
         if initial_converged:
-            logger.info("Filter already converged, no wiggle needed")
+            # logger.info("Filter already converged, no wiggle needed")
             return True
 
     attempt = 0
     while attempt < max_attempts:
         attempt += 1
-        logger.info(f"Wiggle attempt {attempt}/{max_attempts} - Duration: {duration_seconds}s, Angular vel: ±{angular_velocity} rad/s")
+        # logger.info(f"Wiggle attempt {attempt}/{max_attempts} - Duration: {duration_seconds}s, Angular vel: ±{angular_velocity} rad/s")
 
         # Wiggle pattern: left -> right -> left -> right
         wiggle_cycle_duration = duration_seconds / 4  # Quarter of total time per direction
@@ -144,7 +144,7 @@ async def imu_wiggle(
         # Stop the robot
         stop_twist = Twist2d(linear_velocity_x=0.0, angular_velocity=0.0)
         await canbus_client.request_reply("/twist", stop_twist)
-        logger.info("Wiggle complete, robot stopped")
+        # logger.info("Wiggle complete, robot stopped")
 
         # Wait a moment for filter to settle
         await asyncio.sleep(0.5)
@@ -153,15 +153,16 @@ async def imu_wiggle(
         if filter_client and check_convergence:
             converged = await check_filter_convergence(filter_client)
             if converged:
-                logger.info(f"✓ Filter converged after {attempt} wiggle attempt(s)!")
+                # logger.info(f"✓ Filter converged after {attempt} wiggle attempt(s)!")
                 return True
             else:
-                logger.warning(f"Filter still diverged after attempt {attempt}/{max_attempts}")
+                # logger.warning(f"Filter still diverged after attempt {attempt}/{max_attempts}")
+                pass  # Continue to next attempt
         else:
             # If not checking convergence, assume success after wiggling
-            logger.info("Wiggle complete (convergence check disabled)")
+            # logger.info("Wiggle complete (convergence check disabled)")
             return True
 
     # Failed to converge after max attempts
-    logger.error(f"✗ Filter did not converge after {max_attempts} wiggle attempts")
+    # logger.error(f"✗ Filter did not converge after {max_attempts} wiggle attempts")
     return False 
