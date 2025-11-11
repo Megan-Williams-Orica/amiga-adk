@@ -65,7 +65,7 @@ theta = math.radians(TILT_DEG)
 
 # Initialize IMU tilt compensation
 # NOTE: Set ENABLE_IMU_COMPENSATION = False if IMU readings are incorrect
-ENABLE_IMU_COMPENSATION = True  # Enabled after calibration
+ENABLE_IMU_COMPENSATION = False  # Enabled after calibration
 imu_compensator = IMUTiltCompensation(nominal_pitch_deg=TILT_DEG, nominal_roll_deg=0.0)
 
 # IMU calibration baseline (calibrated on level ground)
@@ -805,7 +805,7 @@ class Transforms:
         """Update camera-to-robot transform with IMU-compensated tilt angles."""
         # Mount correction in CAMERA frame with IMU compensation
         R_mount_cam = (Rotation3F64.Rx(math.radians(-effective_pitch_deg)) *
-                       Rotation3F64.Rz(math.radians(-effective_roll_deg)))
+                       Rotation3F64.Rz(math.radians(+effective_roll_deg)))
 
         # Net camera->robot rotation
         R_cam_to_robot = self.R_align * R_mount_cam

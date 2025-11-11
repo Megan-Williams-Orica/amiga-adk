@@ -113,10 +113,15 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
     """
     Listens for UDP 'cone_goal' messages from detectionPlot.py and overrides waypoint positions.
 
+    NEW BEHAVIOR (Phase 2):
+    - Continuously buffers collar detections for each waypoint from 2-6m distance
+    - motion_planner.next_track_segment() queries buffer BEFORE creating approach segment
+    - Approach segment aims directly at detected collar (not CSV waypoint)
+    - Robot still refines position at 1.5m for final accuracy
+
     When vision is enabled (detectionPlot.py is running):
     - CSV waypoints act as 'search zone centers' with radius VISION_SEARCH_RADIUS_M
-    - When a cone is detected within the search radius, the waypoint position is overridden
-      with the actual cone location
+    - When a cone is detected within the search radius, it's added to the buffer
     - Navigation manager handles all execution, deployment, and state management
     - Robot drives to cones instead of CSV waypoints when vision is enabled
 
@@ -137,6 +142,14 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
     # Track all cone detections for visualization
     if not hasattr(nav_manager, "cone_detections"):
         nav_manager.cone_detections = []
+
+    # NEW: Vision detection buffer for pre-approach planning
+    # Structure: {waypoint_idx: [(timestamp, x, y, confidence, distance), ...]}
+    if not hasattr(motion_planner, "vision_detection_buffer"):
+        motion_planner.vision_detection_buffer = {}
+
+    # Buffer retention time (keep detections from last 10 seconds)
+    BUFFER_RETENTION_S = 10.0
 
     # --- socket setup -------------------------------------------------------
     loop = asyncio.get_running_loop()
@@ -275,22 +288,49 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                 # print(f"[VISION] skip: waypoint {target_wp_idx} already processed by vision")
                 continue
 
-            # ---- debounce ----
             now = asyncio.get_event_loop().time()
+
+            # ---- NEW: Add detection to buffer for pre-approach planning ----
+            # Buffer detections from planning range (2-6m) for use BEFORE approach segment creation
+            PLANNING_RANGE_MIN = 2.0  # Minimum distance for planning detections
+            PLANNING_RANGE_MAX = 6.0  # Maximum distance for planning detections
+
+            if PLANNING_RANGE_MIN <= r <= PLANNING_RANGE_MAX:
+                # Add to buffer
+                if target_wp_idx not in motion_planner.vision_detection_buffer:
+                    motion_planner.vision_detection_buffer[target_wp_idx] = []
+
+                # Clean old detections from buffer (older than BUFFER_RETENTION_S)
+                motion_planner.vision_detection_buffer[target_wp_idx] = [
+                    det for det in motion_planner.vision_detection_buffer[target_wp_idx]
+                    if now - det[0] < BUFFER_RETENTION_S
+                ]
+
+                # Add new detection: (timestamp, x_world, y_world, confidence, distance, robot_dist)
+                motion_planner.vision_detection_buffer[target_wp_idx].append(
+                    (now, X_obj, Y_obj, conf, dist_goal_wp, r)
+                )
+
+                print(f"[VISION BUFFER] Added detection for WP {target_wp_idx}: "
+                      f"({X_obj:.2f}, {Y_obj:.2f}), dist_from_csv={dist_goal_wp:.2f}m, "
+                      f"robot_dist={r:.2f}m, buffer_size={len(motion_planner.vision_detection_buffer[target_wp_idx])}")
+
+            # ---- Check if robot is waiting at approach position for collar detection (REFINEMENT) ----
+            # Only allow waypoint overrides when robot has stopped at approach waypoint (1.5m before collar)
+            # This is the REFINEMENT step for final accuracy
+            if not getattr(nav_manager, "waiting_for_collar_detection", False):
+                # Not at approach position - just buffer the detection and continue
+                continue
+
+            # Robot is at approach position - perform refinement override
+            # ---- debounce for refinement ----
             if last_goal is not None:
                 moved = math.hypot(x - last_goal[0], y - last_goal[1])
                 if moved < MIN_DIST_DELTA and (now - last_sent_t) < MIN_PERIOD_S:
                     # print(f"[VISION] skip: debounce (moved={moved:.2f}, dt={now-last_sent_t:.2f})")
                     continue
 
-            # ---- Check if robot is waiting at approach position for collar detection ----
-            # Only allow waypoint overrides when robot has stopped at approach waypoint (2m before collar)
-            # This prevents overrides during row-end turns or other maneuvers when heading is incorrect
-            if not getattr(nav_manager, "waiting_for_collar_detection", False):
-                print("[VISION] skip: not at approach position yet, waiting for robot to stop before collar")
-                continue
-
-            # --- Override waypoint position with cone location ---
+            # --- Override waypoint position with refined cone location ---
             try:
                 # Override the next waypoint position with the detected cone position
                 modified_idx = await motion_planner.override_next_waypoint_world_xy(X_obj, Y_obj, yaw_rad=None)
@@ -311,7 +351,7 @@ async def vision_goal_listener(motion_planner, controller_client, nav_manager, p
                     "robot_heading": yaw
                 }
                 nav_manager.cone_detections.append(cone_detection_record)
-                logger.info(f"[VISION] Cone detected at ({X_obj:.2f}, {Y_obj:.2f}) for waypoint {target_wp_idx}, nav manager will execute track")
+                logger.info(f"[VISION REFINEMENT] Collar detected at ({X_obj:.2f}, {Y_obj:.2f}) for waypoint {target_wp_idx}, refining position")
 
                 # Update last goal for debouncing
                 last_goal = (x, y)

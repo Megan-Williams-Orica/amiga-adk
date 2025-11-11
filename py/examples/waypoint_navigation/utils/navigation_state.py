@@ -74,7 +74,7 @@ def _save_state_to_file(state: NavigationStateData) -> None:
             json.dump(asdict(state), f)
         temp_file.replace(STATE_FILE)
         # Debug logging
-        print(f"[NAV_STATE] Saved: WP {state.current_waypoint_index}/{state.total_waypoints}, status={state.track_status}")
+        # print(f"[NAV_STATE] Saved: WP {state.current_waypoint_index}/{state.total_waypoints}, status={state.track_status}")
     except Exception as e:
         print(f"Warning: Failed to save navigation state: {e}")
 

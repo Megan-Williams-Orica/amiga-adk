@@ -404,7 +404,7 @@ class MotionPlanner:
         # 10 degrees | relatively small heading error
         HEADING_THRESHOLD = np.radians(10)
         MIN_LONGITUDINAL_DISTANCE = (
-            2.0  # 2 meters | ensure we're at least 2 m behind the goal to ensure a smooth arrival
+            1.8  # 2 meters | ensure we're at least 2 m behind the goal to ensure a smooth arrival
         )
 
         bearing = analysis['bearing_angle']
@@ -429,7 +429,7 @@ class MotionPlanner:
             return FirstManeuver.LATERAL_CORRECTION
 
     async def build_track_to_robot_relative_goal(
-        self, x_fwd_m: float, y_left_m: float, standoff_m: float = 0.75, spacing: float = 0.1
+        self, x_fwd_m: float, y_left_m: float, standoff_m: float = 0.5, spacing: float = 0.1
         ):
         """Convert (x_fwd,y_left) in robot frame into a world pose and build a short AB track."""
         current_pose = await self._get_current_pose()  # uses your running filter task 
@@ -567,7 +567,7 @@ class MotionPlanner:
         goal_y = goal_pose.a_from_b.translation[1]
         distance_to_waypoint = hypot(goal_x - current_x, goal_y - current_y)
 
-        APPROACH_OFFSET = 1.5
+        APPROACH_OFFSET = 1.2
         if distance_to_waypoint > APPROACH_OFFSET + 0.5:  # Add 0.5m buffer
             # Robot is far - use approach waypoint
             approach_x, approach_y = _offset_towards(
@@ -656,6 +656,96 @@ class MotionPlanner:
 
         return track_builder.track
 
+    async def wait_for_vision_buffer(self, waypoint_idx: int, timeout_s: float = 0.1, check_interval_s: float = 0.2) -> bool:
+        """Wait for vision buffer to populate with sufficient detections for planning.
+
+        This look-ahead pause allows the vision system to detect the next collar
+        before we plan the approach direction.
+
+        Args:
+            waypoint_idx: The waypoint index to wait for detections
+            timeout_s: Maximum time to wait (default 3.0 seconds)
+            check_interval_s: How often to check buffer (default 0.2 seconds)
+
+        Returns:
+            True if sufficient detections were collected, False if timeout
+        """
+        MIN_CONFIDENCE = 0.7
+        MIN_DETECTIONS = 1
+
+        logger.info(f"[VISION LOOKAHEAD] Waiting up to {timeout_s}s for collar detections for waypoint {waypoint_idx}...")
+
+        start_time = asyncio.get_event_loop().time()
+
+        while True:
+            elapsed = asyncio.get_event_loop().time() - start_time
+
+            if elapsed >= timeout_s:
+                logger.info(f"[VISION LOOKAHEAD] Timeout after {timeout_s}s - proceeding with CSV waypoint")
+                return False
+
+            # Check if we have sufficient detections
+            if hasattr(self, "vision_detection_buffer"):
+                detections = self.vision_detection_buffer.get(waypoint_idx, [])
+                high_conf_detections = [
+                    det for det in detections
+                    if det[3] >= MIN_CONFIDENCE
+                ]
+
+                if len(high_conf_detections) >= MIN_DETECTIONS:
+                    logger.info(f"[VISION LOOKAHEAD] Got {len(high_conf_detections)} detections after {elapsed:.1f}s")
+                    return True
+
+            # Wait before checking again
+            await asyncio.sleep(check_interval_s)
+
+    def get_best_collar_estimate_from_vision(self, waypoint_idx: int) -> Optional[Tuple[float, float]]:
+        """Get the best collar position estimate from vision detection buffer.
+
+        This is called BEFORE creating the approach segment to aim directly at the detected collar.
+        Uses median filtering of recent detections to reduce noise.
+
+        Args:
+            waypoint_idx: The waypoint index to get collar estimate for
+
+        Returns:
+            Tuple of (x_world, y_world) if reliable detection exists, None otherwise
+        """
+        if not hasattr(self, "vision_detection_buffer"):
+            return None
+
+        detections = self.vision_detection_buffer.get(waypoint_idx, [])
+
+        if len(detections) == 0:
+            logger.info(f"[VISION PLANNING] No buffered detections for waypoint {waypoint_idx}")
+            return None
+
+        # Filter for high-confidence detections
+        MIN_CONFIDENCE = 0.7
+        MIN_DETECTIONS = 2  # Require at least 2 detections for reliability
+
+        high_conf_detections = [
+            det for det in detections
+            if det[3] >= MIN_CONFIDENCE  # det[3] is confidence
+        ]
+
+        if len(high_conf_detections) < MIN_DETECTIONS:
+            logger.info(f"[VISION PLANNING] Insufficient high-confidence detections for waypoint {waypoint_idx}: "
+                       f"{len(high_conf_detections)}/{len(detections)} (need {MIN_DETECTIONS})")
+            return None
+
+        # Use median position of recent high-confidence detections (robust to outliers)
+        x_positions = [det[1] for det in high_conf_detections]  # det[1] is x_world
+        y_positions = [det[2] for det in high_conf_detections]  # det[2] is y_world
+
+        median_x = float(np.median(x_positions))
+        median_y = float(np.median(y_positions))
+
+        logger.info(f"[VISION PLANNING] Using median collar estimate for waypoint {waypoint_idx}: "
+                   f"({median_x:.2f}, {median_y:.2f}) from {len(high_conf_detections)} detections")
+
+        return (median_x, median_y)
+
     async def create_approach_to_waypoint_segment(self) -> Track:
         """Create segment from current approach position to the actual waypoint.
 
@@ -702,7 +792,7 @@ class MotionPlanner:
                 self._turn_waypoint_1 = self._compute_waypoint_ahead(
                     current_pose, distance=self.headland_buffer
                 )
-                logger.info(f"[TURN] Created virtual waypoint 1 at {self.headland_buffer}m ahead")
+                # logger.info(f"[TURN] Created virtual waypoint 1 at {self.headland_buffer}m ahead")
 
             # Build track from current position to cached waypoint
             current_pose = await self._get_current_pose()
@@ -835,6 +925,17 @@ class MotionPlanner:
             track: Optional[Track] = None
             maneuver_type: FirstManeuver = await self._determine_first_maneuver()
             if maneuver_type == FirstManeuver.AB:
+                # NEW: Wait for vision buffer to populate, then check for collar detection
+                next_wp_idx = 1
+                await self.wait_for_vision_buffer(next_wp_idx, timeout_s=0.5)
+
+                collar_estimate = self.get_best_collar_estimate_from_vision(next_wp_idx)
+                if collar_estimate is not None:
+                    collar_x, collar_y = collar_estimate
+                    # Override waypoint with detected collar position
+                    await self.override_next_waypoint_world_xy(collar_x, collar_y, yaw_rad=None)
+                    logger.info(f"[VISION PLANNING] Overriding waypoint {next_wp_idx} with buffered collar detection before approach")
+
                 # Check distance to determine if we should use approach offset
                 current_pose = await self._get_current_pose()
                 goal_pose = self.waypoints.get(1)
@@ -845,7 +946,7 @@ class MotionPlanner:
                     goal_y = goal_pose.a_from_b.translation[1]
                     distance_to_waypoint = hypot(goal_x - current_x, goal_y - current_y)
 
-                    APPROACH_OFFSET = 1.5
+                    APPROACH_OFFSET = 1.2
                     if distance_to_waypoint > APPROACH_OFFSET + 0.5:  # Add 0.5m buffer
                         # Robot is far - use approach offset
                         track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=APPROACH_OFFSET)
@@ -873,9 +974,19 @@ class MotionPlanner:
             # We're not transitioning to a new row, we will just create an AB segment to the next waypoint
             curr_index = self.current_waypoint_index
 
+            # NEW: Wait for vision buffer to populate, then check for collar detection
+            next_waypoint_idx = self.current_waypoint_index + 1
+            await self.wait_for_vision_buffer(next_waypoint_idx, timeout_s=0.5)
+
+            collar_estimate = self.get_best_collar_estimate_from_vision(next_waypoint_idx)
+            if collar_estimate is not None:
+                collar_x, collar_y = collar_estimate
+                # Override waypoint with detected collar position
+                await self.override_next_waypoint_world_xy(collar_x, collar_y, yaw_rad=None)
+                logger.info(f"[VISION PLANNING] Overriding waypoint {next_waypoint_idx} with buffered collar detection before approach")
+
             # Check if robot is already close to the next waypoint
             current_pose = await self._get_current_pose()
-            next_waypoint_idx = self.current_waypoint_index + 1
             if next_waypoint_idx in self.waypoints:
                 target_pose = self.waypoints[next_waypoint_idx]
                 current_x = current_pose.a_from_b.translation[0]
@@ -885,7 +996,7 @@ class MotionPlanner:
                 distance_to_waypoint = hypot(target_x - current_x, target_y - current_y)
 
                 # Only use two-stage approach if robot is far enough away
-                APPROACH_OFFSET = 1.5
+                APPROACH_OFFSET = 1.2
                 if distance_to_waypoint > APPROACH_OFFSET + 0.5:  # Add 0.5m buffer
                     # Robot is far - use two-stage approach
                     track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=APPROACH_OFFSET)
@@ -913,9 +1024,19 @@ class MotionPlanner:
             self._clear_turn_waypoints()
             curr_index = self.current_waypoint_index
 
+            # NEW: Wait for vision buffer to populate, then check for collar detection
+            next_waypoint_idx = self.current_waypoint_index + 1
+            await self.wait_for_vision_buffer(next_waypoint_idx, timeout_s=0.5)
+
+            collar_estimate = self.get_best_collar_estimate_from_vision(next_waypoint_idx)
+            if collar_estimate is not None:
+                collar_x, collar_y = collar_estimate
+                # Override waypoint with detected collar position
+                await self.override_next_waypoint_world_xy(collar_x, collar_y, yaw_rad=None)
+                logger.info(f"[VISION PLANNING] Overriding waypoint {next_waypoint_idx} with buffered collar detection before approach")
+
             # Check if robot is already close to the first waypoint of next row
             current_pose = await self._get_current_pose()
-            next_waypoint_idx = self.current_waypoint_index + 1
             if next_waypoint_idx in self.waypoints:
                 target_pose = self.waypoints[next_waypoint_idx]
                 current_x = current_pose.a_from_b.translation[0]
@@ -925,7 +1046,7 @@ class MotionPlanner:
                 distance_to_waypoint = hypot(target_x - current_x, target_y - current_y)
 
                 # Only use two-stage approach if robot is far enough away
-                APPROACH_OFFSET = 1.5
+                APPROACH_OFFSET = 1.2
                 if distance_to_waypoint > APPROACH_OFFSET + 0.5:  # Add 0.5m buffer
                     # Robot is far - use two-stage approach
                     track = await self._create_ab_segment_to_next_waypoint(approach_offset_m=APPROACH_OFFSET)

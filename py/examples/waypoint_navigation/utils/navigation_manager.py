@@ -132,7 +132,7 @@ class NavigationManager:
             f"Setting track with {len(track.waypoints)} waypoints...")
         try:
             await self._set_track_locked(track)
-            logger.info("SUCCESS: Track set")
+            # logger.info("SUCCESS: Track set")
         except Exception as e:
             logger.error(f"FAIL: Track not set {e}")
             raise
@@ -180,10 +180,10 @@ class NavigationManager:
 
     async def start_following(self) -> None:
         """Start following the currently set track."""
-        logger.info("Starting track following...")
+        # logger.info("Starting track following...")
         try:
             await self._start_following_locked()
-            logger.info("START: Track following")
+            # logger.info("START: Track following")
         except Exception as e:
             logger.error(f"FAIL: track following not started: {e}")
             raise
@@ -220,19 +220,21 @@ class NavigationManager:
         prev_status = self.current_track_status
         self.current_track_status = track_status
 
-        # Log status changes
+        # Log status changes (only for aborted/cancelled)
         if prev_status != track_status:
             try:
                 status_name = TrackStatusEnum.Name(track_status)
-                logger.info(f"Track status changed: {status_name}")
-                # Update Flask GUI state
+                # Only log if status is TRACK_ABORTED or TRACK_CANCELLED
+                if track_status in [TrackStatusEnum.TRACK_ABORTED, TrackStatusEnum.TRACK_CANCELLED]:
+                    logger.info(f"Track status changed: {status_name}")
+                # Update Flask GUI state (always update GUI regardless of status)
                 set_navigation_state(track_status=status_name)
             except Exception as e:
                 logger.error(f"ERROR: getting status name: {e}")
 
         # Check for completion or failure
         if track_status == TrackStatusEnum.TRACK_COMPLETE:
-            logger.info("SUCCESS: Track completed")
+            # logger.info("SUCCESS: Track completed")
             self.track_complete_event.set()
 
         elif track_status in [
@@ -335,7 +337,7 @@ class NavigationManager:
             self.cone_detected_for_current_wp = False
         self.current_waypoint_start_time = asyncio.get_event_loop().time()
 
-        logger.info("[VISION] Vision enabled - waiting indefinitely for cone detection in search zone...")
+        # logger.info("[VISION] Vision enabled - waiting indefinitely for cone detection in search zone...")
 
         # Wait indefinitely for cone detection
         while not getattr(self, "cone_detected_for_current_wp", False):
@@ -344,7 +346,7 @@ class NavigationManager:
 
             await asyncio.sleep(0.1)
 
-        logger.info("[VISION] Cone detected in search zone - proceeding to cone")
+        # logger.info("[VISION] Cone detected in search zone - proceeding to cone")
         return True
 
     def get_user_choice(self) -> str:
@@ -491,7 +493,7 @@ class NavigationManager:
                     if canbus_retry_count <= max_canbus_retries:
                         # Wait for canbus service to recover before retrying
                         recovery_delay = 3.0  # Give canbus service time to clear backlog
-                        logger.warning(f"CANBUS_TIMEOUT detected. Waiting {recovery_delay}s for service recovery (attempt {canbus_retry_count}/{max_canbus_retries})...")
+                        # logger.warning(f"CANBUS_TIMEOUT detected. Waiting {recovery_delay}s for service recovery (attempt {canbus_retry_count}/{max_canbus_retries})...")
 
                         # Cancel current track
                         await self._cancel_following()
@@ -517,7 +519,7 @@ class NavigationManager:
         self.track_executing = False
 
         if success:
-            logger.info("SUCCESS: Track segment completed")
+            # logger.info("SUCCESS: Track segment completed")
 
             # Add recovery delay to allow CAN bus to settle before next segment
             # This helps prevent CANBUS_TIMEOUT failures in track follower
@@ -535,7 +537,7 @@ class NavigationManager:
 
                     # 2) Deploy plumbob (tool already over hole)
                     await trigger_dipbob("can0")
-                    logger.info("Deploying dipbob")
+                    # logger.info("Deploying dipbob")
                     await asyncio.sleep(3.0)  # TODO: swap for measurement await
 
                     # 3) Move forward so robot origin is over the hole
@@ -573,7 +575,7 @@ class NavigationManager:
                 completed_wp_idx = self.motion_planner.current_waypoint_index - 1
                 mark_waypoint_complete(completed_wp_idx)
                 set_navigation_state(current_waypoint_index=self.motion_planner.current_waypoint_index)
-                logger.info(f"[GUI] Updated Flask state: completed waypoint {completed_wp_idx}, now targeting {self.motion_planner.current_waypoint_index}/{len(self.motion_planner.waypoints)}")
+                # logger.info(f"[GUI] Updated Flask state: completed waypoint {completed_wp_idx}, now targeting {self.motion_planner.current_waypoint_index}/{len(self.motion_planner.waypoints)}")
         else:
             logger.warning("ERROR: Track segment failed or timed out")
 
@@ -676,16 +678,23 @@ class NavigationManager:
                     success = await self.execute_single_track(final_approach_track, do_post_actions=True)
 
                 elif is_waypoint_segment:
-                    # Old behavior: direct waypoint approach (shouldn't happen with new approach system)
-                    # This path is used when robot starts close to waypoint (skips approach segment)
-                    # Check if this is a waypoint segment (not turn/approach) and wait for vision if enabled
-                    # Use _wait_for_cone_or_skip which checks if vision is enabled
-                    # If vision is enabled: waits indefinitely for cone
-                    # If vision is disabled: proceeds immediately to CSV waypoint
+                    # Direct waypoint approach (robot starts close to waypoint, skips approach segment)
+                    # This should use the same two-stage logic as approach segments to ensure deployment
+                    # happens at the correct location after vision refinement
+
+                    logger.info("[DIRECT APPROACH] Executing initial segment (no deployment yet)")
+                    success = await self.execute_single_track(track_segment, do_post_actions=False)
+
+                    if not success:
+                        logger.warning("Direct approach segment failed, retrying...")
+                        continue
+
+                    logger.info("[DIRECT APPROACH] Reached waypoint vicinity, waiting for collar detection...")
 
                     # Set flag to allow vision to override waypoint position
                     self.waiting_for_collar_detection = True
 
+                    # Wait for vision to detect collar
                     should_proceed = await self._wait_for_cone_or_skip()
 
                     # Clear flag after vision detection or skip
@@ -695,18 +704,22 @@ class NavigationManager:
                         # Shutdown was requested during wait
                         break
 
-                    # Rebuild track if vision overrode the waypoint position
-                    # Vision system calls override_next_waypoint_world_xy() which modifies motion_planner.waypoints
-                    # but doesn't rebuild the track, so we need to rebuild it here
+                    # Rebuild track from current position to actual collar location
                     if getattr(self, "cone_detected_for_current_wp", False):
-                        logger.info("[VISION] Rebuilding track with vision-overridden waypoint position")
-                        track_segment, _ = await self.motion_planner.redo_last_segment()
+                        logger.info("[VISION] Collar detected, creating final approach track to collar")
+                        final_approach_track = await self.motion_planner.create_approach_to_waypoint_segment()
+                    else:
+                        logger.info("[VISION] No collar detected, proceeding to CSV waypoint")
+                        final_approach_track = await self.motion_planner.create_approach_to_waypoint_segment()
 
                     # Reset flag for next waypoint
                     self.cone_detected_for_current_wp = False
 
-                    # Execute the track segment with deployment
-                    success = await self.execute_single_track(track_segment, do_post_actions=True)
+                    # Execute final approach with deployment
+                    final_segment_name = f"final_direct_{segment_name}"
+                    self.navigation_progress[final_segment_name] = final_approach_track
+                    logger.info("[DIRECT APPROACH] Executing final approach to collar/waypoint with deployment")
+                    success = await self.execute_single_track(final_approach_track, do_post_actions=True)
                 else:
                     # Turn/maneuver segments - no deployment
                     success = await self.execute_single_track(track_segment, do_post_actions=False)
