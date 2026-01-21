@@ -1,15 +1,25 @@
-from flask import Flask, Response
-import threading
-import time
+import argparse
+import asyncio
+import cv2
+import depthai as dai
+import logging
 import signal
 import sys
+import time
+import threading
 import traceback
 sys.path.insert(0, '/mnt/managed_home/farm-ng-user-patrick-orica')
 import nms_patch
 
-import depthai as dai
-import cv2
+from farm_ng.canbus.canbus_pb2 import Twist2d
+from farm_ng.core.event_client import EventClient
+from farm_ng.core.event_service_pb2 import EventServiceConfig
+from farm_ng.core.events_file_reader import proto_from_json_file
 
+from flask import Flask, Response
+from pathlib import Path
+
+from utils.amiga_movement import move_forwards, move_backwards
 from utils.pose_recognition import poseKeypoints
 
 from ultralytics import YOLO
@@ -32,8 +42,7 @@ DEVICE = "14442C1001A528D700"
 
 # Thread states
 current_frame = None
-pipeline_ready = threading.Event()
-shutdown_event = threading.Event()
+shutdown_event = None
 frame_lock = threading.Lock()
 
 # FPS variables
@@ -47,21 +56,26 @@ def roi_coords(xmin, xmax, ymin, ymax, frame_width, frame_height, config, inputC
     bottomRight = dai.Point2f(xmax / frame_width, ymax / frame_height)
 
     config.roi = dai.Rect(topLeft, bottomRight)
-
     cfg = dai.SpatialLocationCalculatorConfig()
     cfg.addROI(config)
     inputConfigQ.send(cfg)
 
 
 # ------- Camera Initialisation & Gesture Recognition -------
-def camera_thread():
-    global current_frame, camera_fps
+async def camera_thread(client):
+    global current_frame, camera_fps, shutdown_event
     device = None
     pipeline = None
 
     # Initialise ROI coords
     topLeft = dai.Point2f(0.1, 0.1)
     bottomRight = dai.Point2f(0.1, 0.1)
+
+    # Initialise the twist command to send to the canbus
+    twist = Twist2d()
+
+    # Initialise shutdown event (to terminate camera stream)
+    shutdown_event = asyncio.Event()
 
     try:
         # Initialise device and pipeline
@@ -93,6 +107,7 @@ def camera_thread():
         config = dai.SpatialLocationCalculatorConfigData()
         config.depthThresholds.lowerThreshold = 10  # in mm
         config.depthThresholds.upperThreshold = 10000  # in mm
+        calculationAlgorithm = dai.SpatialLocationCalculatorAlgorithm.MEDIAN
         config.roi = dai.Rect(topLeft, bottomRight)
 
         spatialLocationCalculator.inputConfig.setWaitForMessage(False)
@@ -108,7 +123,6 @@ def camera_thread():
 
         # Start the pipeline
         pipeline.start()
-        pipeline_ready.set()
         print("Pipeline has started.\n")
         print("Detectable poses:")
         print(" - T-Pose: Both arms extended horizontally.")
@@ -133,7 +147,7 @@ def camera_thread():
                     gesture = model(latestRGB, verbose=False, conf=CONFIDENCE_THRESHOLD)
                     gesture_frame = gesture[0].plot()
 
-                    # If there are keypoints (determined by the mode), classify the pose
+                    # If there are keypoints, classify the pose
                     if gesture[0].keypoints is not None:
                         gesture_detection = pose_classifier.YOLO11classifyPose(gesture[0].keypoints)
 
@@ -161,9 +175,13 @@ def camera_thread():
                             cv2.putText(gesture_frame, f"Y: {int(spatialData_now.spatialCoordinates.y)} mm", (xmin + 10, 430), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
                             cv2.putText(gesture_frame, f"Z: {int(spatialData_now.spatialCoordinates.z)} mm", (xmin + 10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
 
-                    # Assign the gesture frame to the current frame and lock the frame (threading)
+                    # Assign the gesture frame to the current frame
                     with frame_lock:
                         current_frame = gesture_frame
+
+                    user_result = await pose_classifier.gesture_user_input(gesture_detection)
+                    if user_result == "commence":
+                        await move_forwards(twist, client)
 
     except Exception as e:
         print(f"Camera error: {e}")
@@ -179,9 +197,7 @@ def camera_thread():
 
 def generate_frames():
     # Wait for camera initialisation
-    if not pipeline_ready.wait(timeout=10):
-        print("Camera initialisation failed")
-        return
+    time.sleep(3)
 
     frame_interval = 1.0 / fps_limit
     last_send_time = 0
@@ -258,31 +274,67 @@ def video_feed():
 
 def signal_handler(sig, frame):
     print("Shutdown signal received...\n")
-    shutdown_event.set()
-    time.sleep(0.5)  # Give threads time to clean up
+    if shutdown_event is not None:
+        try:
+            asyncio.get_event_loop().call_soon_threadsafe(shutdown_event.set)
+        except RuntimeError:
+            pass
     print("Exiting.\n")
     sys.exit(0)
 
 
-if __name__ == '__main__':
+async def main(service_config_path: Path) -> None:
+    # Create a client to the canbus service
+    config: EventServiceConfig = proto_from_json_file(service_config_path, EventServiceConfig())
+    client: EventClient = EventClient(config)
+
     # Register signal handler
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Start camera in background thread
-    print("Starting camera initialisation...")
-    cam_thread = threading.Thread(target=camera_thread, daemon=False)
-    cam_thread.start()
-    time.sleep(2)
+    # Remove all flask messages in terminal that are NOT errors
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
 
-    # Start web server
-    print("To view the Amiga camera stream, visit: http://192.168.1.70:5500 \n")
+    # Start the web server
+    flask_thread = threading.Thread(
+        target=lambda: app.run(host='0.0.0.0', port=5500, threaded=True, debug=False, use_reloader=False),
+        daemon=True)
+    flask_thread.start()
+
+    await asyncio.sleep(2)
+    print("The Amiga camera stream is available at: http://192.168.1.70:5500 \n")
+
+    # Start camera task
+    print("Initialising the camera...")
+    cam_thread = asyncio.create_task(camera_thread(client))
+    await asyncio.sleep(2)
+
+    print("The Amiga has finished initialising. The camera feed should now be visible.")
 
     try:
-        app.run(host='0.0.0.0', port=5500, threaded=True, debug=False, use_reloader=False)
+        while not shutdown_event.is_set():
+            await asyncio.sleep(0.5)
     except KeyboardInterrupt:
         pass
     finally:
         shutdown_event.set()
-        cam_thread.join(timeout=2)
-        print("Cleanup complete")
+        await asyncio.sleep(0.5)
+
+        cam_thread.cancel()
+
+        try:
+            await cam_thread
+        except asyncio.CancelledError:
+            pass
+
+        await asyncio.sleep(0.5)
+        print("Camera stream has been terminated")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        prog="python3 main.py", description="Run gesture control via camera stream on the Amiga")
+    parser.add_argument("--service-config", type=Path, required=True, help="The canbus service config.")
+    args = parser.parse_args()
+    asyncio.run(main(args.service_config))
+
