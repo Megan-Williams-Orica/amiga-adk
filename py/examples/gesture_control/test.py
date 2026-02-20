@@ -1,29 +1,29 @@
-from flask import Flask, Response
-import threading
-import time
+import depthai as dai
+
+import argparse
+import asyncio
+import cv2
+import logging
 import signal
 import sys
-import logging
+import time
+import threading
 import traceback
-import argparse
 sys.path.insert(0, '/mnt/managed_home/farm-ng-user-patrick-orica')
 import nms_patch
 
-import depthai as dai
-import cv2
-import asyncio
-
-from pathlib import Path
 from farm_ng.canbus.canbus_pb2 import Twist2d
 from farm_ng.core.event_client import EventClient
 from farm_ng.core.event_service_pb2 import EventServiceConfig
 from farm_ng.core.events_file_reader import proto_from_json_file
 
+from flask import Flask, Response
+from pathlib import Path
+
+from utils.amiga_movement import move_forwards, move_backwards
 from utils.pose_recognition import poseKeypoints
 
 from ultralytics import YOLO
-
-from utils.amiga_movement import move_forwards, move_backwards
 
 # Initialise the browser "app" created by flask
 app = Flask(__name__)
@@ -68,7 +68,7 @@ async def camera_thread(client):
     device = None
     pipeline = None
 
-    # Initialise ROI coords (pre-detection)
+    # Initialise ROI coords
     topLeft = dai.Point2f(0.1, 0.1)
     bottomRight = dai.Point2f(0.1, 0.1)
 
@@ -148,7 +148,7 @@ async def camera_thread(client):
                     gesture = model(latestRGB, verbose=False, conf=CONFIDENCE_THRESHOLD)
                     gesture_frame = gesture[0].plot()
 
-                    # If there are keypoints (determined by the mode), classify the pose
+                    # If there are keypoints, classify the pose
                     if gesture[0].keypoints is not None:
                         gesture_detection = pose_classifier.YOLO11classifyPose(gesture[0].keypoints)
 
@@ -184,8 +184,6 @@ async def camera_thread(client):
                     if user_result == "commence":
                         await move_forwards(twist, client)
 
-    except asyncio.CancelledError:
-        print("Camera stream was cancelled")
     except Exception as e:
         print(f"Camera error: {e}")
         traceback.print_exc()
@@ -205,7 +203,7 @@ def generate_frames():
     frame_interval = 1.0 / fps_limit
     last_send_time = 0
 
-    while True:
+    while not shutdown_event.is_set():
         now = time.monotonic()
         elapsed_time = now - last_send_time
 
@@ -283,6 +281,7 @@ def signal_handler(sig, frame):
         except RuntimeError:
             pass
     print("Exiting.\n")
+    sys.exit(0)
 
 
 async def main(service_config_path: Path) -> None:
@@ -298,7 +297,7 @@ async def main(service_config_path: Path) -> None:
     log = logging.getLogger('werkzeug')
     log.setLevel(logging.ERROR)
 
-    # Start web server
+    # Start the web server
     flask_thread = threading.Thread(
         target=lambda: app.run(host='0.0.0.0', port=5500, threaded=True, debug=False, use_reloader=False),
         daemon=True)
@@ -307,7 +306,7 @@ async def main(service_config_path: Path) -> None:
     await asyncio.sleep(2)
     print("The Amiga camera stream is available at: http://192.168.1.70:5500 \n")
 
-    # Start camera in background thread
+    # Start camera task
     print("Initialising the camera...")
     cam_thread = asyncio.create_task(camera_thread(client))
     await asyncio.sleep(2)
@@ -324,6 +323,7 @@ async def main(service_config_path: Path) -> None:
         await asyncio.sleep(0.5)
 
         cam_thread.cancel()
+
         try:
             await cam_thread
         except asyncio.CancelledError:
@@ -332,11 +332,9 @@ async def main(service_config_path: Path) -> None:
         await asyncio.sleep(0.5)
         print("Camera stream has been terminated")
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        prog="python3 test.py", description="Run gesture control via camera stream on the Amiga."
-    )
+        prog="python3 main.py", description="Run gesture control via camera stream on the Amiga")
     parser.add_argument("--service-config", type=Path, required=True, help="The canbus service config.")
     args = parser.parse_args()
     asyncio.run(main(args.service_config))

@@ -287,7 +287,7 @@ async def main(service_config_path: Path) -> None:
     # Create a client to the canbus service
     config: EventServiceConfig = proto_from_json_file(service_config_path, EventServiceConfig())
     client: EventClient = EventClient(config)
-
+If this timeslot does not work, I will reschedule the meeting to another suitable time. 
     # Register signal handler
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -337,4 +337,3 @@ if __name__ == "__main__":
     parser.add_argument("--service-config", type=Path, required=True, help="The canbus service config.")
     args = parser.parse_args()
     asyncio.run(main(args.service_config))
-

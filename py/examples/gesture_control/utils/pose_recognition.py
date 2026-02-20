@@ -616,18 +616,17 @@ class poseKeypoints:
 
         print(f"Amiga detected the gesture: {gesture.pose_name}!")
         if gesture.pose_name == 'Left Arm Wide':
-            print("The Amiga is assigned to move backwards")
+            print("The Amiga is assigned to move forwards (in a straight line) towards the operator.")
         # TODO: Update for specific gestures: t-pose, both arms up, etc.
         while True:
             try:
                 choice = await ainput("Do you wish to proceed with this gesture's assigned action? (y/n): ")
-                choice = choice.strip().lower()
                 if choice in ["y"]:
                     print("Assigned action will commence now.")
                     if gesture.pose_name == "Left Arm Wide":
-                        print("ATTN: The Amiga is moving backwards. Keep the surrounding area clear!")
+                        print("he Amiga is now moving forwards. Keep the surrounding area clear!")
                         return "commence"
-                    print("No action is assigned, but y has been processed.")
+                    print("No action is assigned, but the gesture has been processed.")
                     return "understood"
                 elif choice in ["n"]:
                     print("Assigned action will not commence. Continuing with the camera feed...")
