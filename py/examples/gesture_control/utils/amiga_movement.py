@@ -18,10 +18,26 @@ from farm_ng.track.track_pb2 import TrackFollowRequest
 from farm_ng_core_pybind import Isometry3F64
 from farm_ng_core_pybind import Rotation3F64
 
-from utils.pose_recognition import poseKeypoints
 
-# Initialise pose keypoints classifier to access angle calculations
-keypoints_angle = poseKeypoints(confidence_threshold=0.3)
+def calculateOperatorAngle(x, y, frame_width=480):
+    """Calculates the angle of the operator.
+
+    Args:
+        x, y: Points as (x, y) tuples,
+        frame_width: Frame width of the OAK-D camera feed
+
+    Returns:
+        Angle in radians
+    """
+    # Determine the (horizontal) centre point of a human
+    centre_point = (x[0] + y[0]) / 2
+
+    offset = (centre_point - (frame_width / 2)) / (frame_width / 2)  # Normalised offset from centre (-1 to 1)
+
+    camera_FOV = np.radians(63)  # OAK-D horizontal FOV in radians
+    angle = offset * (camera_FOV / 2)  # Calculate angle based on offset and FOV
+
+    return -angle
 
 
 async def create_initial_pose(client: Optional[EventClient] = None, timeout: float = 0.5) -> Pose3F64:
@@ -42,13 +58,13 @@ async def create_initial_pose(client: Optional[EventClient] = None, timeout: flo
     return start
 
 
-async def create_initial_pose_updated(client: Optional[EventClient] = None, timeout: float = 0.5) -> Pose3F64:
-    # Beware: There is a bug in this function which seems to cause the robot to rotate during
-    #         execution of movement forwards. A fix has been applied, but is yet to be verified
+async def create_initial_pose_updated(client: Optional[EventClient] = None, timeout: float = 0.5) -> Tuple[Pose3F64, float]:
     zero_tangent = np.zeros((6, 1), dtype=np.float64)
     start: Pose3F64 = Pose3F64(
         a_from_b=Isometry3F64(), frame_a="world", frame_b="robot", tangent_of_b_in_a=zero_tangent
     )
+    new_start = start
+    orientation = 0.0
     if client is not None:
         try:
             state: FilterState = await asyncio.wait_for(
@@ -57,15 +73,16 @@ async def create_initial_pose_updated(client: Optional[EventClient] = None, time
             start = Pose3F64.from_proto(state.pose)
             orientation = state.heading
 
-            # To fix bug: preserve pose by creating a new pose with the same information and fix translation
-            preserved_pose = Pose3F64(
-                a_from_b=Isometry3F64(),
+            fixed_isometry = Isometry3F64(
+                rotation=Rotation3F64.Rz(orientation),
+                translation=start.translation
+            )
+            new_start = Pose3F64(
+                a_from_b=fixed_isometry,
                 frame_a=start.frame_a,
                 frame_b=start.frame_b,
                 tangent_of_b_in_a=start.tangent_of_b_in_a
             )
-            preserved_pose.translation = start.translation
-            new_start = preserved_pose
         except asyncio.TimeoutError:
             print("Timeout while getting filter state")
         except Exception as e:
@@ -74,7 +91,7 @@ async def create_initial_pose_updated(client: Optional[EventClient] = None, time
 
 
 async def track_forwards(z_coordinate, client: Optional[EventClient] = None, save_track: Optional[Path] = None) -> Track:
-    start: Pose3F64 = await create_initial_pose(client)
+    start = await create_initial_pose(client)
     print(f"Initial pose: x = {start.translation[0]}, y = {start.translation[1]}")
 
     trackbuilder = TrackBuilder(start=start)
@@ -86,37 +103,28 @@ async def track_forwards(z_coordinate, client: Optional[EventClient] = None, sav
 
     return trackbuilder.track
 
-# TODO: Create a async function to create segments between the Amiga and the operator, where the Amiga
-#       tracks the operator's position and orientation by creating the initial pose.
-#       Then, a track is built by creating the appropriate segments. These segments should allow the Amiga
-#       to line up with the operator's orientation and then move forwards towards them.
-
-# Potentially, you could observe the heading of the robot, and take the difference between the heading and
-# the operator's orientation to determine how much to rotate, and in
-#  which direction. Then, you could create a
-# track with a rotation segment followed by a straight segment.
-
-# This TODO has since been implemented below, but is yet to be verified in functionality
-
 
 async def track_to_operator(z_coordinate, left_hip, right_hip, client: Optional[EventClient] = None, save_track: Optional[Path] = None) -> Track:
-    initial_pose: Pose3F64 = await create_initial_pose_updated(client)
-    print(f"Initial pose: x = {initial_pose.translation[0]}, y = {initial_pose.translation[1]}, heading = {initial_pose.orientation}")
+    initial_pose, orientation = await create_initial_pose_updated(client)
+    print(f"Initial pose: x = {initial_pose.translation[0]}, y = {initial_pose.translation[1]}, heading = {orientation}")
 
-    human_angle = keypoints_angle.calculateHorizontalAngle(left_hip, right_hip)
-    desired_heading = human_angle - initial_pose.orientation
-    desired_heading_wrapped = np.arctan2(np.sin(desired_heading), np.cos(desired_heading))
+    human_angle = calculateOperatorAngle(left_hip, right_hip, frame_width=480)
+
+    print(f"human angle: {human_angle}")
+
+    desired_heading = np.arctan2(np.sin(human_angle), np.cos(human_angle))
 
     trackbuilder = TrackBuilder(start=initial_pose)
 
-    trackbuilder.create_ab_segment(next_frame_b="rotate to operator", final_pose=Pose3F64(
-        a_from_b=Isometry3F64(rotation=Rotation3F64.Rz(desired_heading_wrapped),
-                              translation=np.zeros(3)), frame_a=initial_pose.frame_b, frame_b="rotated pose", tangent_of_b_in_a=np.zeros((6, 1), dtype=np.float64)), spacing=0.05)
+    print("Created track builder")
+
+    trackbuilder.create_turn_segment(next_frame_b="rotate to operator", angle=desired_heading, spacing=0.05)
 
     trackbuilder.create_straight_segment(next_frame_b="move to operator", distance=z_coordinate, spacing=0.05)
 
     if save_track is not None:
         trackbuilder.save_track(save_track)
+        print("Robot track should be saved")
 
     return trackbuilder.track
 
@@ -185,14 +193,11 @@ async def coord_move_to_operator(
         movement_config: EventServiceConfig,
         filter_client: EventClient,
         z_coordinate: float,
-        left_hip: Tuple,                                 # Might have to change this
-        right_hip: Tuple,                                # Might have to change this
+        left_hip: Tuple,
+        right_hip: Tuple,
         save_track: Optional[Path] = None,
         movement_client: Optional[EventClient] = None,
 ) -> None:
-    # Convert z-coordinate distance from mm to metres and apply a scaling factor
-    # (replace 1.2 with actual camera height and pitch calibration once determined)
-    distance_m = (z_coordinate / 1000.0) / 1.2
     """Orient the robot towards the operator and move the robot forwards based on detected
     z-coordinate (forward distance in mm).
 
@@ -205,6 +210,9 @@ async def coord_move_to_operator(
         save_track: Optional Path to save the generated track for debugging
         movement_client: Optional EventClient to use for setting and starting the track
     """
+    # Convert z-coordinate distance from mm to metres and apply a scaling factor
+    # (replace 1.2 with actual camera height and pitch calibration once determined)
+    distance_m = (z_coordinate / 1000.0) / 1.8
 
     # Create track by generating waypoints from current pose to target
     track = await track_to_operator(distance_m, left_hip, right_hip, filter_client, save_track)
@@ -220,6 +228,7 @@ async def coord_move_to_operator(
 
             # Start the robot moving along the track
             await start(movement_config)
+            print("Robot should have followed the track")
     except Exception as e:
         print(f"Error during track execution: {e}")
 
