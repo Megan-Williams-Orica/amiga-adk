@@ -63,7 +63,7 @@ class poseKeypoints:
             a, b: Points as (x, y) tuples
 
         Returns:
-                Angle in degrees
+            Angle in degrees
         """
         # Convert the tuple arguments to numpy arrays
         a = np.array(a)
@@ -616,7 +616,9 @@ class poseKeypoints:
 
         print(f"Amiga detected the gesture: {gesture.pose_name}!")
         if gesture.pose_name == 'Left Arm Wide':
-            print("The Amiga is assigned to move forwards (in a straight line) towards the operator.")
+            print("The Amiga is assigned to orient with and move forwards (in a straight line) towards the operator.")
+        elif gesture.pose_name == 'Right Arm Wide':
+            print("The Amiga is assigned to search for and detect collars using the OAK2 camera.")
         # TODO: Update for specific gestures: t-pose, both arms up, etc.
         while True:
             try:
@@ -624,8 +626,11 @@ class poseKeypoints:
                 if choice in ["y"]:
                     print("Assigned action will commence now.")
                     if gesture.pose_name == "Left Arm Wide":
-                        print("he Amiga is now moving forwards. Keep the surrounding area clear!")
+                        print("The Amiga is now reorienting and moving forwards. Keep the surrounding area clear!")
                         return "commence"
+                    elif gesture.pose_name == "Right Arm Wide":
+                        print("The Amiga is now searching for collars. Please move out of the way of the camera. ")
+                        return "search"
                     print("No action is assigned, but the gesture has been processed.")
                     return "understood"
                 elif choice in ["n"]:
