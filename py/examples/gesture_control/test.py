@@ -20,11 +20,14 @@ from farm_ng.core.event_client import EventClient
 from farm_ng.core.event_service_pb2 import EventServiceConfig, EventServiceConfigList
 from farm_ng.core.events_file_reader import proto_from_json_file
 
-from utils.pose_recognition import poseKeypoints
+from util.pose_recognition import poseKeypoints
 
 from ultralytics import YOLO
 
-from utils.amiga_movement import coord_move_to_operator
+from util.amiga_movement import coord_move_to_operator
+
+sys.path.insert(0, '/mnt/managed_home/farm-ng-user-patrick-orica/Amiga/X-Platform')
+from utils.detection_relay import DetectionRelay
 
 # Initialise the browser "app" created by flask
 app = Flask(__name__)
@@ -34,7 +37,7 @@ CONFIDENCE_THRESHOLD = 0.5
 fps_limit = 20
 
 # Device information
-DEVICE = "14442C1001A528D700"
+DEVICE = "14442C1001A528D700"  # OAK1 camera
 
 # Thread states
 current_frame = None
@@ -49,6 +52,11 @@ rightarmwide_frames = 0
 rightarmup_frames = 0
 tpose_frames = 0
 armsup_frames = 0
+i = 0
+
+# Initialise collar coordinate variables
+x_collar = 0
+y_collar = 0
 
 
 # Calculate new ROI coordinates each time a bounding box is detected
@@ -64,8 +72,11 @@ def roi_coords(xmin, xmax, ymin, ymax, frame_width, frame_height, spatial_config
 
 # ------- Camera Initialisation & Gesture Recognition -------
 async def camera_thread(canbus_client, filter_client, track_client, movement_config):
+    # Initialise global variables
     global current_frame, shutdown_event, leftarmwide_frames, leftarmup_frames, rightarmwide_frames
-    global rightarmup_frames, tpose_frames, armsup_frames
+    global rightarmup_frames, tpose_frames, armsup_frames, x_collar, y_collar
+
+    # Initialise camera variables
     device = None
     pipeline = None
     spatialData_now = None
@@ -76,6 +87,10 @@ async def camera_thread(canbus_client, filter_client, track_client, movement_con
 
     # Initialise shutdown event (to terminate camera stream)
     shutdown_event = asyncio.Event()
+
+    # Initialise OAK2 collar detection
+    relay = DetectionRelay()
+    await relay.start()
 
     try:
         # Initialise device and pipeline
@@ -154,6 +169,9 @@ async def camera_thread(canbus_client, filter_client, track_client, movement_con
                     gesture = model(latestRGB, verbose=False, conf=CONFIDENCE_THRESHOLD)
                     gesture_frame = gesture[0].plot()
 
+                    coords_text = f"Collar: x = {x_collar:.2f} m, y = {y_collar:.2f} m"
+                    cv2.putText(gesture_frame, coords_text, (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 2)
+
                     # If there are keypoints (determined by the mode), classify the pose
                     if gesture[0].keypoints is not None:
                         gesture_detection = pose_classifier.YOLO11classifyPose(gesture[0].keypoints)
@@ -198,6 +216,12 @@ async def camera_thread(canbus_client, filter_client, track_client, movement_con
                                     await coord_move_to_operator(
                                         movement_config, filter_client, z_coord_now, left_hip, right_hip, movement_client=track_client
                                     )
+                                elif user_result == "search":
+                                    det = relay.get_latest()
+                                    if det:
+                                        x_collar = det.x_fwd_m
+                                        y_collar = det.y_left_m
+                                        print(f"Collar detected at coordinates: x = {det.x_fwd_m} m, y = {det.y_left_m} m")
 
                                 leftarmwide_frames = 0
                                 leftarmup_frames = 0
@@ -248,6 +272,7 @@ async def camera_thread(canbus_client, filter_client, track_client, movement_con
             pipeline.stop()
         if device:
             device.close()
+        await relay.stop()
         print("Camera successfully stopped ")
 
 
