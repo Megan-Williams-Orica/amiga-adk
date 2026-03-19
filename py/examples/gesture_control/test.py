@@ -24,7 +24,7 @@ from util.pose_recognition import poseKeypoints
 
 from ultralytics import YOLO
 
-from util.amiga_movement import coord_move_to_operator
+from util.amiga_movement import coord_move_to_operator, robot_dipbob
 
 sys.path.insert(0, '/mnt/managed_home/farm-ng-user-patrick-orica/Amiga/X-Platform')
 from utils.detection_relay import DetectionRelay
@@ -207,7 +207,7 @@ async def camera_thread(canbus_client, filter_client, track_client, movement_con
                             if detected_gesture >= 50:
                                 print(f"\nGesture '{max_gesture}' detected for 50 frames!")
                                 z_coord_now = spatialData_now.spatialCoordinates.z
-                                print(f"The person is {z_coord_now} mm away")
+                                print(f"The person is {z_coord_now/1.8} mm away")
                                 user_result = await pose_classifier.gesture_user_input(gesture_detection)
                                 if user_result == "commence":
                                     keypoints_data = gesture[0].keypoints
@@ -219,9 +219,14 @@ async def camera_thread(canbus_client, filter_client, track_client, movement_con
                                 elif user_result == "search":
                                     det = relay.get_latest()
                                     if det:
+                                        print(f"{det}")
                                         x_collar = det.x_fwd_m
                                         y_collar = det.y_left_m
-                                        print(f"Collar detected at coordinates: x = {det.x_fwd_m} m, y = {det.y_left_m} m")
+                                        print(f"Collar detected at coordinates: x = {det.x_fwd_m/2.4} m, y = {det.y_left_m/3.0} m")
+                                elif user_result == "dipbob":
+                                    await robot_dipbob(
+                                        movement_config, filter_client, 1.300, x_collar, y_collar, movement_client=track_client
+                                    )
 
                                 leftarmwide_frames = 0
                                 leftarmup_frames = 0

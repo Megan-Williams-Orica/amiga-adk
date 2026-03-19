@@ -492,8 +492,7 @@ class poseKeypoints:
         right_wrist_height = points[keypoints[1]][1] - points[keypoints[5]][1]
 
         # Determine the orientation of the right wrist w.r.t. the right shoulder
-        right_wrist_orient = abs(points[keypoints[5]][0] -
-                                 points[keypoints[1]][0])
+        right_wrist_orient = abs(points[keypoints[5]][0] - points[keypoints[1]][0])
 
         # Determine if the left wrist is above the left shoulder and
         # if it is, return None
@@ -615,10 +614,12 @@ class poseKeypoints:
             return "none"
 
         print(f"Amiga detected the gesture: {gesture.pose_name}!")
-        if gesture.pose_name == 'Left Arm Wide':
+        if gesture.pose_name == "Left Arm Wide":
             print("The Amiga is assigned to orient with and move forwards (in a straight line) towards the operator.")
-        elif gesture.pose_name == 'Right Arm Wide':
+        elif gesture.pose_name == "Right Arm Wide":
             print("The Amiga is assigned to search for and detect collars using the OAK2 camera.")
+        elif gesture.pose_name == "Left Arm Up":
+            print("The Amiga is assigned to orient the dipbob over the collar and dip the collar.")
         # TODO: Update for specific gestures: t-pose, both arms up, etc.
         while True:
             try:
@@ -629,8 +630,11 @@ class poseKeypoints:
                         print("The Amiga is now reorienting and moving forwards. Keep the surrounding area clear!")
                         return "commence"
                     elif gesture.pose_name == "Right Arm Wide":
-                        print("The Amiga is now searching for collars. Please move out of the way of the camera. ")
+                        print("The Amiga is now searching for collars. Please move out of the way of the camera.")
                         return "search"
+                    elif gesture.pose_name == "Left Arm Up":
+                        print("The Amiga is now orienting the dipbob with the collar and dipping. Keep the surrounding area clear!")
+                        return "dipbob"
                     print("No action is assigned, but the gesture has been processed.")
                     return "understood"
                 elif choice in ["n"]:

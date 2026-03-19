@@ -6,7 +6,7 @@ from farm_ng_core_pybind import Pose3F64
 from google.protobuf.empty_pb2 import Empty
 
 from farm_ng.filter.filter_pb2 import FilterState
-from utils.track_planner import TrackBuilder
+from util.track_planner import TrackBuilder
 
 from farm_ng.core.event_client import EventClient
 from farm_ng.core.event_service_pb2 import EventServiceConfig
@@ -90,6 +90,30 @@ async def create_initial_pose_updated(client: Optional[EventClient] = None, time
     return new_start, orientation
 
 
+async def pose_to_newpose(x_collar, y_collar, client: Optional[EventClient] = None, timeout: float = 0.5) -> Tuple[Pose3F64, float]:
+    initial_pose, orientation = await create_initial_pose_updated(client)
+    print(f"Initial pose: x = {initial_pose.translation[0]}, y = {initial_pose.translation[1]}, heading = {orientation}")
+
+    final_pose = np.array([initial_pose.translation[0] + x_collar, initial_pose.translation[1] + y_collar, 0.0])
+    final_dir = final_pose - np.array(initial_pose.translation)
+
+    dir = final_dir / np.linalg.norm(final_dir)
+    desired_heading = np.arctan2(dir[1], dir[0])
+
+    new_isometry = Isometry3F64(
+        rotation=Rotation3F64.Rz(desired_heading),
+        translation=final_pose
+    )
+    new_pose = Pose3F64(
+        a_from_b=new_isometry,
+        frame_a="world",
+        frame_b="robot",
+        tangent_of_b_in_a=initial_pose.tangent_of_b_in_a
+    )
+    print(f"Final pose: x = {new_pose.translation[0]}, y = {new_pose.translation[1]}, heading = {desired_heading}")
+    return initial_pose, orientation, new_pose, desired_heading
+
+
 async def track_forwards(z_coordinate, client: Optional[EventClient] = None, save_track: Optional[Path] = None) -> Track:
     start = await create_initial_pose(client)
     print(f"Initial pose: x = {start.translation[0]}, y = {start.translation[1]}")
@@ -124,7 +148,19 @@ async def track_to_operator(z_coordinate, left_hip, right_hip, client: Optional[
 
     if save_track is not None:
         trackbuilder.save_track(save_track)
-        print("Robot track should be saved")
+
+    return trackbuilder.track
+
+
+async def track_to_dipbob(dipbob_distance, x_collar, y_collar, client: Optional[EventClient] = None, save_track: Optional[Path] = None) -> Track:
+    initial_pose, orientation, final_pose, desired_heading = await pose_to_newpose(x_collar, y_collar, client)
+
+    trackbuilder = TrackBuilder(start=initial_pose)
+    trackbuilder.create_turn_segment(next_frame_b="move to dipbob", angle=desired_heading, spacing=0.05)
+    trackbuilder.create_straight_segment(next_frame_b="orient over dipbob", distance=dipbob_distance, spacing=0.05)
+
+    if save_track is not None:
+        trackbuilder.save_track(save_track)
 
     return trackbuilder.track
 
@@ -211,7 +247,6 @@ async def coord_move_to_operator(
         movement_client: Optional EventClient to use for setting and starting the track
     """
     # Convert z-coordinate distance from mm to metres and apply a scaling factor
-    # (replace 1.2 with actual camera height and pitch calibration once determined)
     distance_m = (z_coordinate / 1000.0) / 1.8
 
     # Create track by generating waypoints from current pose to target
@@ -233,3 +268,42 @@ async def coord_move_to_operator(
         print(f"Error during track execution: {e}")
 
     print(f"Robot is now moving forwards towards the operator for {distance_m:.3f}m")
+
+
+async def robot_dipbob(
+    movement_config: EventServiceConfig,
+    filter_client: EventClient,
+    dipbob_distance: float,
+    x_collar: float,
+    y_collar: float,
+    save_track: Optional[Path] = None,
+    movement_client: Optional[EventClient] = None,
+) -> None:
+    """Orient the robot's dipbob over the collar according to the collar coordinates and dipbob distance,
+    and dip the collar.
+
+    Args:
+    config: EventServiceConfig for the track follower service
+    client: EventClient to communicate with services
+    dipbob_distance: Forward distance in metres from the dipbob to the camera
+    x_collar: x-coordinate of the collar in the camera frame
+    y_collar: y-coordinate of the collar in the camera frame
+    save_track: Optional Path to save the generated track for debugging
+    movement_client: Optional EventClient to use for setting and starting the track
+    """
+    x_collar = x_collar / 2.4
+    y_collar = y_collar / 3.0
+    distance = dipbob_distance + x_collar
+
+    track = await track_to_dipbob(distance, x_collar, y_collar, filter_client, save_track)
+
+    try:
+        if movement_client is not None:
+            await movement_client.request_reply("/set_track", TrackFollowRequest(track=track))
+            await movement_client.request_reply("/start", Empty())
+        else:
+            await set_track(movement_config, track)
+
+            await start(movement_config)
+    except Exception as e:
+        print(f"Error during track execution: {e}")

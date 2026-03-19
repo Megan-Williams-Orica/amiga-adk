@@ -1,0 +1,17 @@
+# OAK2 Camera Configuration Derived from the XStem Navigation System Configuration
+
+vision:
+  min_confidence: 0.7
+
+  forward_camera:
+    service_name: "oak/2"
+    role: "forward"
+    model_path: "~/Amiga/X-Platform/models/best1.engine"
+    ip_address: "10.95.76.12"
+    offset_x: 0.55
+    offset_y: 0.0
+    offset_z: 0.88
+    pitch_deg: 30.0
+
+
+
